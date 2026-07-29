@@ -1,0 +1,463 @@
+from __future__ import annotations
+
+import asyncio
+import tempfile
+import time
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
+
+from agent_types import CancellationToken, Candidate, SolveCancelled, Tile
+from orchestrator import (
+    AgentConfig,
+    AgentController,
+    RecipeGate,
+    SubmissionManager,
+)
+from solver import TileSolver
+from tool_runtime import TaskToolRuntime
+from verification import CandidateVerifier
+
+
+def candidate(
+    task_id: str = "Q-A5",
+    *,
+    recipe: str = "Cryptic:500",
+    generation: int = 0,
+    answer: str = "TOKEN-ABC",
+    source: str = "artifact:artifact-0001",
+    confidence: float = 0.99,
+    answer_format: str = "exact",
+) -> Candidate:
+    return Candidate(
+        task_id=task_id,
+        answer=answer,
+        answer_format=answer_format,
+        category="Cryptic",
+        points=500,
+        recipe_key=recipe,
+        recipe_generation=generation,
+        confidence=confidence,
+        evidence="computed twice and matched",
+        source=source,
+    )
+
+
+class VerificationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.verifier = CandidateVerifier(0.82)
+
+    def test_accepts_artifact_backed_exact_answer(self) -> None:
+        result = self.verifier.verify(candidate())
+        self.assertTrue(result.accepted, result.note)
+
+    def test_rejects_low_confidence_model_retyping(self) -> None:
+        result = self.verifier.verify(candidate(source="model", confidence=0.90))
+        self.assertFalse(result.accepted)
+
+    def test_validates_numeric_and_literal_shapes(self) -> None:
+        numeric = candidate(answer="$1,234.50", answer_format="numeric")
+        literal = candidate(answer='["a", 2]', answer_format="literal")
+        self.assertTrue(self.verifier.verify(numeric).accepted)
+        self.assertTrue(self.verifier.verify(literal).accepted)
+        self.assertFalse(
+            self.verifier.verify(
+                candidate(answer="many", answer_format="numeric")
+            ).accepted
+        )
+
+
+class ToolRuntimeTests(unittest.TestCase):
+    def test_artifact_answer_preserves_exact_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            run_result = runtime.execute(
+                "run_python",
+                {"code": 'print("GHOST-6SAS2HPHXQ5V")'},
+            )
+            self.assertIn("artifact-0001", run_result)
+            record_result = runtime.execute(
+                "record_answer",
+                {
+                    "artifact_id": "artifact-0001",
+                    "extraction_regex": r"(GHOST-[A-Z0-9]+)",
+                    "regex_group": 1,
+                    "confidence": 0.99,
+                    "evidence": "decoded and format checked",
+                },
+            )
+            self.assertIn('"recorded": true', record_result)
+            self.assertEqual(runtime.recorded_answer.answer, "GHOST-6SAS2HPHXQ5V")
+
+    def test_paths_cannot_escape_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            result = runtime.execute("read_file", {"path": "../secret"})
+            self.assertIn("path escapes", result)
+
+    def test_python_subprocess_does_not_receive_team_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            result = runtime.execute(
+                "run_python",
+                {
+                    "code": (
+                        "import os; print(os.environ.get('TEAM_API_KEY', "
+                        "'not-present'))"
+                    )
+                },
+            )
+            self.assertIn("not-present", result)
+
+    def test_cancellation_kills_running_python_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token = CancellationToken()
+            runtime = TaskToolRuntime(
+                directory, "https://example.test", cancellation=token
+            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                started = time.monotonic()
+                future = pool.submit(
+                    runtime.execute,
+                    "run_python",
+                    {"code": "import time; time.sleep(10)", "timeout": 20},
+                )
+                time.sleep(0.15)
+                token.cancel("claimed elsewhere")
+                with self.assertRaises(SolveCancelled):
+                    future.result(timeout=2)
+                self.assertLess(time.monotonic() - started, 2)
+
+
+class FakeMessages:
+    def __init__(self, responses: list[SimpleNamespace]) -> None:
+        self.responses = responses
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+class FakeSolverGame:
+    BASE = "https://example.test"
+    MODEL = "test-model"
+
+    def __init__(self, directory: str) -> None:
+        first = SimpleNamespace(
+            type="tool_use",
+            id="tool-1",
+            name="run_python",
+            input={"code": 'print("TOKEN-ABC")'},
+        )
+        second = SimpleNamespace(
+            type="tool_use",
+            id="tool-2",
+            name="record_answer",
+            input={
+                "artifact_id": "artifact-0001",
+                "extraction_regex": r"(TOKEN-[A-Z]+)",
+                "regex_group": 1,
+                "confidence": 0.99,
+                "evidence": "script emitted and pattern checked",
+            },
+        )
+        self.messages = FakeMessages(
+            [
+                SimpleNamespace(content=[first]),
+                SimpleNamespace(content=[second]),
+            ]
+        )
+        self.client = SimpleNamespace(messages=self.messages)
+        self.directory = Path(directory)
+        self.logs: list[str] = []
+
+    def task(self, _task_id: str) -> dict:
+        return {
+            "prompt": "Compute the token using Python.",
+            "category": "Cryptic",
+            "points": 500,
+            "answer_format": "exact",
+            "files": [],
+        }
+
+    def workdir(self, _task_id: str) -> Path:
+        return self.directory
+
+    @staticmethod
+    def fetch_files(_task_id: str, _detail: dict) -> list[str]:
+        return []
+
+    def anthropic_client(self):
+        return self.client
+
+    def log(self, *values) -> None:
+        self.logs.append(" ".join(map(str, values)))
+
+
+class SolverTests(unittest.TestCase):
+    def test_tool_loop_returns_artifact_backed_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = FakeSolverGame(directory)
+            solver = TileSolver(game, max_turns=4)
+            result = solver.solve(
+                Tile(id="PR-C5", category="Cryptic", points=500),
+                recipe_generation=0,
+            )
+            self.assertIsNotNone(result)
+            self.assertEqual(result.answer, "TOKEN-ABC")
+            self.assertEqual(result.source, "artifact:artifact-0001")
+            self.assertIsNotNone(result.replay_recipe)
+            self.assertEqual(len(game.messages.calls), 2)
+
+            replayed = solver.solve(
+                Tile(id="PR-C5-b", category="Cryptic", points=500),
+                recipe_generation=0,
+                replay_recipe=result.replay_recipe,
+            )
+            self.assertEqual(replayed.answer, "TOKEN-ABC")
+            self.assertTrue(replayed.replayed)
+            self.assertEqual(len(game.messages.calls), 2)
+
+    def test_streamed_model_call_closes_when_cancelled(self) -> None:
+        class Stream:
+            def __init__(self) -> None:
+                self.started = Event()
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                self.closed = True
+
+            def __iter__(self):
+                self.started.set()
+                while True:
+                    time.sleep(0.01)
+                    yield object()
+
+            @staticmethod
+            def get_final_message():
+                raise AssertionError("cancelled stream must not complete")
+
+        stream = Stream()
+        messages = SimpleNamespace(stream=lambda **_kwargs: stream)
+        client = SimpleNamespace(messages=messages)
+        token = CancellationToken()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(TileSolver._model_call, client, {}, token)
+            self.assertTrue(stream.started.wait(timeout=1))
+            token.cancel("claimed elsewhere")
+            with self.assertRaises(SolveCancelled):
+                future.result(timeout=1)
+        self.assertTrue(stream.closed)
+
+
+class RecipeGateTests(unittest.TestCase):
+    def test_scored_phase_holds_sibling_until_canary_passes(self) -> None:
+        gate = RecipeGate()
+        gate.set_phase("round1")
+        first = candidate("Q-C5-a")
+        sibling = candidate("Q-C5-b")
+        now = time.monotonic()
+        self.assertTrue(gate.can_submit(first, now))
+        self.assertFalse(gate.can_submit(sibling, now))
+        gate.on_correct(first)
+        self.assertTrue(gate.can_submit(sibling, now))
+
+    def test_wrong_canary_invalidates_generation(self) -> None:
+        gate = RecipeGate()
+        gate.set_phase("game")
+        first = candidate("C5-a")
+        gate.on_incorrect(first, 30)
+        self.assertFalse(gate.is_current(first))
+        self.assertEqual(gate.generation(first.recipe_key), 1)
+
+
+class SubmissionManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_single_lane_releases_sibling_after_correct_canary(self) -> None:
+        class Game:
+            def __init__(self) -> None:
+                self.submitted: list[str] = []
+
+            def submit(self, task_id: str, _answer: str) -> dict:
+                self.submitted.append(task_id)
+                return {"result": "correct"}
+
+            @staticmethod
+            def log(*_values) -> None:
+                return None
+
+        game = Game()
+        gate = RecipeGate()
+        gate.set_phase("round1")
+        results: list[str] = []
+        finished = asyncio.Event()
+
+        async def on_result(value: Candidate, _result: dict) -> None:
+            results.append(value.task_id)
+            if len(results) == 2:
+                finished.set()
+
+        manager = SubmissionManager(
+            game,
+            AgentConfig(submit_interval=0.01),
+            gate,
+            lambda _task_id: True,
+            on_result,
+        )
+        runner = asyncio.create_task(manager.run())
+        await manager.enqueue(candidate("Q-C5-a"))
+        await manager.enqueue(candidate("Q-C5-b"))
+        await asyncio.wait_for(finished.wait(), timeout=2)
+        await manager.stop()
+        await asyncio.wait_for(runner, timeout=2)
+        self.assertEqual(game.submitted, ["Q-C5-a", "Q-C5-b"])
+
+
+class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_once_dry_run_completes_multiple_tiles(self) -> None:
+        class Game:
+            BASE = "https://example.test"
+            MODEL = "test-model"
+
+            def __init__(self) -> None:
+                self.logs: list[str] = []
+
+            @staticmethod
+            def board() -> dict:
+                return {"phase": "practice"}
+
+            @staticmethod
+            def open_tiles(_board: dict) -> list[dict]:
+                return [
+                    {
+                        "id": "PR-C5-a",
+                        "category": "Cryptic",
+                        "points": 500,
+                    },
+                    {
+                        "id": "PR-H4-a",
+                        "category": "Heavy Compute",
+                        "points": 400,
+                    },
+                ]
+
+            def log(self, *values) -> None:
+                self.logs.append(" ".join(map(str, values)))
+
+        class Solver:
+            @staticmethod
+            def solve(
+                tile: Tile,
+                generation: int,
+                _replay=None,
+                _cancellation=None,
+            ) -> Candidate:
+                return Candidate(
+                    task_id=tile.id,
+                    answer="42",
+                    answer_format="numeric",
+                    category=tile.category,
+                    points=tile.points,
+                    recipe_key=tile.recipe_key,
+                    recipe_generation=generation,
+                    confidence=0.99,
+                    evidence="computed independently twice",
+                    source="artifact:artifact-0001",
+                )
+
+        game = Game()
+        controller = AgentController(
+            game,
+            AgentConfig(
+                model_workers=2,
+                run_once=True,
+                dry_run=True,
+                board_poll_seconds=0.01,
+                submit_interval=0.01,
+            ),
+        )
+        controller.solver = Solver()
+        await asyncio.wait_for(controller.run(), timeout=2)
+        self.assertEqual(
+            {record.status.value for record in controller.records.values()},
+            {"solved"},
+        )
+
+    async def test_board_poll_cancels_worker_when_tile_is_claimed(self) -> None:
+        class Game:
+            BASE = "https://example.test"
+            MODEL = "test-model"
+
+            def __init__(self) -> None:
+                self.polls = 0
+                self.logs: list[str] = []
+
+            def board(self) -> dict:
+                self.polls += 1
+                return {"phase": "practice", "tile_open": self.polls == 1}
+
+            @staticmethod
+            def open_tiles(board: dict) -> list[dict]:
+                if not board["tile_open"]:
+                    return []
+                return [
+                    {
+                        "id": "PR-H5-a",
+                        "category": "Heavy Compute",
+                        "points": 500,
+                    }
+                ]
+
+            def log(self, *values) -> None:
+                self.logs.append(" ".join(map(str, values)))
+
+        class BlockingSolver:
+            def __init__(self) -> None:
+                self.started = Event()
+                self.stopped = Event()
+
+            def solve(
+                self,
+                _tile: Tile,
+                _generation: int,
+                _replay,
+                cancellation: CancellationToken,
+            ) -> None:
+                self.started.set()
+                try:
+                    while True:
+                        cancellation.check()
+                        cancellation.wait(0.01)
+                finally:
+                    self.stopped.set()
+
+        game = Game()
+        solver = BlockingSolver()
+        controller = AgentController(
+            game,
+            AgentConfig(
+                model_workers=1,
+                run_once=True,
+                board_poll_seconds=0.01,
+                submit_interval=0.01,
+            ),
+        )
+        controller.solver = solver
+        started = time.monotonic()
+        await asyncio.wait_for(controller.run(), timeout=2)
+        self.assertTrue(solver.started.is_set())
+        self.assertTrue(solver.stopped.is_set())
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(controller.records["PR-H5-a"].status.value, "claimed")
+        self.assertTrue(
+            any("cancelling active work" in message for message in game.logs)
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
