@@ -704,6 +704,22 @@ class FastPathSafetyTests(FastPathFixtureTests):
         self.assertEqual(malformed.status, FastPathStatus.INCONCLUSIVE)
         self.assertFalse(malformed.answer)
 
+        ambiguous_blob = base64.b64encode(
+            b"ONION-ABCDEFGHIJKL\nONION-MNOPQRSTUVWX\n"
+        ).decode("ascii")
+        ambiguous_token, _ = self.dispatch(
+            title="Layer Cake",
+            category="Cryptic",
+            answer_format="exact",
+            prompt=(
+                "Layers include base64 and zlib and may repeat.\n"
+                f"blob: {ambiguous_blob}"
+            ),
+            files={},
+        )
+        self.assertEqual(ambiguous_token.status, FastPathStatus.INCONCLUSIVE)
+        self.assertFalse(ambiguous_token.answer)
+
     def test_zip_traversal_expansion_and_crc_fail_closed(self) -> None:
         unsafe = zip_bytes(
             {

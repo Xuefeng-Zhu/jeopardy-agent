@@ -167,14 +167,23 @@ class TaskFingerprint:
         kinds = Counter(item.kind for item in self.files)
         schemas = sum(bool(item.columns or item.json_keys) for item in self.files)
         archives = sum(bool(item.archive_members) for item in self.files)
-        magic = sorted({item.magic_hex[:16] for item in self.files if item.magic_hex})
+        magic_types: set[str] = set()
+        for item in self.files:
+            if item.magic_hex.startswith("504b"):
+                magic_types.add("zip")
+            elif item.magic_hex.startswith("89504e470d0a1a0a"):
+                magic_types.add("png")
+            elif item.magic_hex.startswith("414a4231"):
+                magic_types.add("ajb1")
+            elif item.kind == "binary":
+                magic_types.add("binary")
         return (
             f"title={self.normalized_title or '<none>'} "
             f"category={self.normalized_category or '<none>'} "
             f"format={self.answer_format} files={len(self.files)} "
             f"extensions={dict(sorted(extensions.items()))} "
             f"kinds={dict(sorted(kinds.items()))} schemas={schemas} "
-            f"archives={archives} magic={magic[:6]} "
+            f"archives={archives} magic_types={sorted(magic_types)} "
             f"errors={len(self.inspection_errors)}"
         )
 
@@ -547,8 +556,10 @@ class LockedBoxHandler(BaseHandler):
         if not fingerprint.magic_hex.startswith("504b"):
             raise FastPathError("bundle.zip has the wrong magic bytes")
         path = context.path("bundle.zip")
-        with ZipFile(path) as archive:
-            members = _validate_archive(archive)
+        if path.stat().st_size > MAX_FAST_FILE_BYTES:
+            raise FastPathError("bundle.zip exceeds the compressed size limit")
+        with ZipFile(io.BytesIO(path.read_bytes())) as archive:
+            members = _validate_archive(archive, context)
             names = {item.filename for item in members}
             if "note.txt" not in names or "inner.blob" not in names:
                 raise FastPathError("bundle is missing note.txt or inner.blob")
@@ -568,12 +579,16 @@ class LockedBoxHandler(BaseHandler):
             key = Path(largest[0].filename).stem[::-1].encode("ascii")
             encrypted = archive.read("inner.blob")
         context.check()
-        decrypted = bytes(value ^ key[index % len(key)] for index, value in enumerate(encrypted))
+        decrypted = _xor_repeating(encrypted, key, context)
         if not decrypted.startswith(b"PK"):
             raise FastPathError("decrypted inner.blob is not a ZIP archive")
         with ZipFile(io.BytesIO(decrypted)) as inner:
-            inner_members = _validate_archive(inner)
-            payload = b"\n".join(inner.read(item) for item in inner_members)
+            inner_members = _validate_archive(inner, context)
+            payloads: list[bytes] = []
+            for item in inner_members:
+                context.check()
+                payloads.append(inner.read(item))
+            payload = b"\n".join(payloads)
         token = _unique_token(payload, rf"VAULT-{TOKEN_CHARS}{{12}}")
         if not token:
             raise FastPathError("inner archive does not contain exactly one VAULT token")
@@ -687,10 +702,8 @@ class CribSheetHandler(BaseHandler):
             if not valid or any(value is None for value in key_slots):
                 continue
             key = bytes(int(value) for value in key_slots)
-            plain = bytes(
-                value ^ key[index % key_length] for index, value in enumerate(cipher)
-            )
-            if not plain.startswith(crib) or not _readable_ascii(plain):
+            plain = _xor_repeating(cipher, key, context)
+            if not plain.startswith(crib) or not _readable_ascii(plain, context):
                 continue
             lines = plain.decode("ascii").splitlines()
             tokens = [
@@ -1185,7 +1198,7 @@ class FastPathDispatcher:
                     status=FastPathStatus.INCONCLUSIVE,
                     handler=handler.name,
                     elapsed_seconds=time.monotonic() - started,
-                    reason=f"{type(exc).__name__}: {exc}",
+                    reason=_safe_failure_reason(exc),
                     fingerprint=fingerprint,
                 )
         return FastPathOutcome.not_applicable(fingerprint)
@@ -1197,6 +1210,22 @@ def is_registered_fast_path_title(title: str) -> bool:
 
 def _normalize(value: str) -> str:
     return " ".join(value.lower().split())
+
+
+def _safe_failure_reason(exc: BaseException) -> str:
+    """Classify a fallback without echoing prompt or file contents into logs."""
+
+    if isinstance(exc, FastPathDeadline):
+        return "FastPathDeadline: handler deadline exceeded"
+    if isinstance(exc, FastPathError):
+        return "FastPathError: deterministic invariant failed"
+    if isinstance(exc, json.JSONDecodeError):
+        return "JSONDecodeError: malformed JSON"
+    if isinstance(exc, BadZipFile):
+        return "BadZipFile: malformed archive"
+    if isinstance(exc, UnicodeError):
+        return f"{type(exc).__name__}: invalid text encoding"
+    return f"{type(exc).__name__}: parse or validation failure"
 
 
 def _safe_task_path(root: Path, name: str) -> Path:
@@ -1446,16 +1475,29 @@ def _validate_archive_paths(infos: list[Any]) -> None:
             raise FastPathError("archive contains an unsafe path")
 
 
-def _validate_archive(archive: ZipFile) -> list[Any]:
+def _validate_archive(
+    archive: ZipFile, context: FastPathContext | None = None
+) -> list[Any]:
     infos = archive.infolist()
     if len(infos) > MAX_ARCHIVE_MEMBERS:
         raise FastPathError("archive member count exceeds limit")
     _validate_archive_paths(infos)
     if sum(item.file_size for item in infos) > MAX_ARCHIVE_EXPANDED:
         raise FastPathError("archive expanded size exceeds limit")
-    bad_member = archive.testzip()
-    if bad_member is not None:
-        raise FastPathError(f"archive CRC failed for {bad_member}")
+    expanded = 0
+    for item in infos:
+        if context is not None:
+            context.check()
+        with archive.open(item) as stream:
+            while True:
+                if context is not None:
+                    context.check()
+                chunk = stream.read(65_536)
+                if not chunk:
+                    break
+                expanded += len(chunk)
+                if expanded > MAX_ARCHIVE_EXPANDED:
+                    raise FastPathError("archive expanded size exceeds limit")
     return infos
 
 
@@ -1509,8 +1551,28 @@ def _png_metadata(raw: bytes, context: FastPathContext) -> tuple[bytes, int]:
     return b"\n".join(metadata), chunks
 
 
-def _readable_ascii(value: bytes) -> bool:
-    return bool(value) and all(byte in {9, 10, 13} or 32 <= byte <= 126 for byte in value)
+def _readable_ascii(value: bytes, context: FastPathContext) -> bool:
+    if not value:
+        return False
+    for index, byte in enumerate(value):
+        if index % 8_192 == 0:
+            context.check()
+        if byte not in {9, 10, 13} and not 32 <= byte <= 126:
+            return False
+    return True
+
+
+def _xor_repeating(
+    value: bytes, key: bytes, context: FastPathContext
+) -> bytes:
+    if not key:
+        raise FastPathError("repeating XOR key is empty")
+    output = bytearray(len(value))
+    for index, byte in enumerate(value):
+        if index % 8_192 == 0:
+            context.check()
+        output[index] = byte ^ key[index % len(key)]
+    return bytes(output)
 
 
 def _numbered_section(text: str, label: str, target: str) -> str:
