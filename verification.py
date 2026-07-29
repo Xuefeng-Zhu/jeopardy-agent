@@ -39,7 +39,6 @@ class CandidateVerifier:
         if (
             not is_practice
             and candidate.points >= 400
-            and not candidate.replayed
             and (
                 not candidate.verification_source
                 or candidate.verification_source == candidate.source

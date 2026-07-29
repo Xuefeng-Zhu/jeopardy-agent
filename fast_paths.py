@@ -42,6 +42,7 @@ MAX_ARCHIVE_EXPANDED = 16_000_000
 MAX_FAST_FILE_BYTES = 12_000_000
 MAX_DIRECT_OUTPUT = 64_000
 TOKEN_CHARS = r"[A-Z0-9]"
+GENERATOR_FINGERPRINT_VERSION = 1
 
 
 class FastPathStatus(str, Enum):
@@ -162,6 +163,52 @@ class TaskFingerprint:
     def files_with_suffix(self, suffix: str) -> tuple[FileFingerprint, ...]:
         return tuple(item for item in self.files if item.suffix == suffix.lower())
 
+    @property
+    def fingerprint_version(self) -> int:
+        return GENERATOR_FINGERPRINT_VERSION
+
+    @property
+    def generator_fingerprint(self) -> str:
+        """Versioned structural identity for safe sibling recipe replay."""
+
+        files = []
+        for item in sorted(self.files, key=lambda value: value.path):
+            files.append(
+                {
+                    "path": _path_template(item.path),
+                    "suffix": item.suffix,
+                    "kind": item.kind,
+                    "magic": _magic_type(item),
+                    "columns": list(item.columns),
+                    "json_keys": list(item.json_keys),
+                    "archive_members": [
+                        {
+                            "path": _path_template(member.name),
+                            "suffix": PurePosixPath(member.name).suffix.lower(),
+                        }
+                        for member in sorted(
+                            item.archive_members, key=lambda value: value.name
+                        )
+                    ],
+                    "error": item.error,
+                }
+            )
+        payload = {
+            "version": self.fingerprint_version,
+            "title": self.normalized_title,
+            "category": self.normalized_category,
+            "answer_format": self.answer_format,
+            "prompt_template": _prompt_template(self.prompt),
+            "files": files,
+            "inspection_error_types": sorted(
+                error.rsplit(":", 1)[-1] for error in self.inspection_errors
+            ),
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        return f"gf{self.fingerprint_version}:{hashlib.sha256(encoded).hexdigest()}"
+
     def compact_summary(self) -> str:
         extensions = Counter(item.suffix or "<none>" for item in self.files)
         kinds = Counter(item.kind for item in self.files)
@@ -178,6 +225,7 @@ class TaskFingerprint:
             elif item.kind == "binary":
                 magic_types.add("binary")
         return (
+            f"generator={self.generator_fingerprint[:16]} "
             f"title={self.normalized_title or '<none>'} "
             f"category={self.normalized_category or '<none>'} "
             f"format={self.answer_format} files={len(self.files)} "
@@ -1134,11 +1182,13 @@ class FastPathDispatcher:
         runtime: TaskToolRuntime,
         *,
         disabled_handlers: frozenset[str] = frozenset(),
+        fingerprint: TaskFingerprint | None = None,
     ) -> FastPathOutcome:
         started = time.monotonic()
-        fingerprint = TaskFingerprint.build(
-            tile, detail, names, runtime.root, runtime.cancellation
-        )
+        if fingerprint is None:
+            fingerprint = TaskFingerprint.build(
+                tile, detail, names, runtime.root, runtime.cancellation
+            )
         for handler in self.handlers:
             runtime.cancellation.check()
             if not handler.recognizes(fingerprint):
@@ -1210,6 +1260,53 @@ def is_registered_fast_path_title(title: str) -> bool:
 
 def _normalize(value: str) -> str:
     return " ".join(value.lower().split())
+
+
+def _prompt_template(value: str) -> str:
+    """Remove instance values while retaining the generator's instructions."""
+
+    normalized = value.lower()
+    substitutions = (
+        (r"https?://[^\s)\]}>'\"]+", "<url>"),
+        (r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", "<email>"),
+        (
+            (
+                r"\b\d{4}-\d{2}-\d{2}(?:[t ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+                r"(?:z|[+-]\d{2}:\d{2})?)?\b"
+            ),
+            "<date>",
+        ),
+        (r"(?<![a-z0-9])[a-f0-9]{24,}(?![a-z0-9])", "<hex>"),
+        (r"(?<![a-z0-9])[a-z0-9+/]{32,}={0,2}(?![a-z0-9])", "<blob>"),
+        (r"""(["']).*?\1""", "<quoted>"),
+        (
+            (
+                r"(?<![a-z0-9_])[-+]?(?:[$€£]\s*)?"
+                r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?(?![a-z0-9_])"
+            ),
+            "<number>",
+        ),
+    )
+    for pattern, replacement in substitutions:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.DOTALL)
+    return " ".join(normalized.split())
+
+
+def _path_template(value: str) -> str:
+    normalized = value.replace("\\", "/").lower()
+    return re.sub(r"\d+", "<n>", normalized)
+
+
+def _magic_type(item: FileFingerprint) -> str:
+    if item.magic_hex.startswith("504b"):
+        return "zip"
+    if item.magic_hex.startswith("89504e470d0a1a0a"):
+        return "png"
+    if item.magic_hex.startswith("414a4231"):
+        return "ajb1"
+    if item.kind == "binary":
+        return "binary"
+    return item.kind
 
 
 def _safe_failure_reason(exc: BaseException) -> str:

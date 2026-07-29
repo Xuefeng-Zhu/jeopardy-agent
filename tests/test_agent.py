@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from types import SimpleNamespace
 from agent_types import (
     CancellationToken,
     Candidate,
+    ReplayRecipe,
     SolveCancelled,
     Tile,
     TileRecord,
@@ -39,6 +41,7 @@ def candidate(
     verification_source: str = "artifact:artifact-0002",
     confidence: float = 0.99,
     answer_format: str = "exact",
+    replayed: bool = False,
 ) -> Candidate:
     return Candidate(
         task_id=task_id,
@@ -52,6 +55,7 @@ def candidate(
         evidence="computed twice and matched",
         source=source,
         verification_source=verification_source,
+        replayed=replayed,
     )
 
 
@@ -70,6 +74,13 @@ class VerificationTests(unittest.TestCase):
     def test_scored_high_value_answer_requires_independent_artifact(self) -> None:
         result = self.verifier.verify(
             candidate(verification_source="")
+        )
+        self.assertFalse(result.accepted)
+        self.assertIn("separate verification artifact", result.note)
+
+    def test_scored_replay_still_requires_independent_artifact(self) -> None:
+        result = self.verifier.verify(
+            candidate(verification_source="", replayed=True)
         )
         self.assertFalse(result.accepted)
         self.assertIn("separate verification artifact", result.note)
@@ -377,19 +388,109 @@ class SolverTests(unittest.TestCase):
             self.assertEqual(result.answer, "TOKEN-ABC")
             self.assertEqual(result.source, "artifact:artifact-0001")
             self.assertIsNotNone(result.replay_recipe)
+            self.assertTrue(result.generator_fingerprint.startswith("gf1:"))
             self.assertEqual(len(game.messages.calls), 2)
             self.assertTrue(
                 any("solver summary outcome=recorded" in line for line in game.logs)
             )
 
+            solver.replay_cache.store(result.replay_recipe)
             replayed = solver.solve(
                 Tile(id="PR-C5-b", category="Cryptic", points=500),
                 recipe_generation=0,
-                replay_recipe=result.replay_recipe,
             )
             self.assertEqual(replayed.answer, "TOKEN-ABC")
             self.assertTrue(replayed.replayed)
+            self.assertNotEqual(replayed.source, replayed.verification_source)
             self.assertEqual(len(game.messages.calls), 2)
+
+    def test_replay_rejects_nondeterministic_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            recipe = ReplayRecipe(
+                code=(
+                    "from pathlib import Path\n"
+                    "path = Path('counter.txt')\n"
+                    "value = int(path.read_text()) + 1 if path.exists() else 1\n"
+                    "path.write_text(str(value))\n"
+                    "print(f'TOKEN-{value}')\n"
+                ),
+                extraction_regex=r"(TOKEN-\d+)",
+            )
+            self.assertIsNone(TileSolver._try_replay(runtime, recipe))
+            self.assertIsNone(runtime.recorded_answer)
+
+    def test_legacy_recipe_is_not_replayed_without_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = FakeSolverGame(directory)
+            solver = TileSolver(game, max_turns=4)
+            result = solver.solve(
+                Tile(id="PR-C5", category="Cryptic", points=500),
+                recipe_generation=0,
+                replay_recipe=ReplayRecipe(
+                    code='raise RuntimeError("must not run")'
+                ),
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.strategy, "claude")
+            self.assertEqual(len(game.messages.calls), 2)
+            self.assertTrue(
+                any("skipped incompatible or legacy" in line for line in game.logs)
+            )
+
+    def test_finalization_turn_can_record_existing_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = FakeSolverGame(directory)
+            first = SimpleNamespace(
+                type="tool_use",
+                id="tool-1",
+                name="run_python",
+                input={"code": 'print("TOKEN-FINAL")'},
+            )
+            second = SimpleNamespace(
+                type="tool_use",
+                id="tool-2",
+                name="search_artifact",
+                input={
+                    "artifact_id": "artifact-0001",
+                    "pattern": r"TOKEN-[A-Z]+",
+                },
+            )
+            third = SimpleNamespace(
+                type="tool_use",
+                id="tool-3",
+                name="record_answer",
+                input={
+                    "artifact_id": "artifact-0001",
+                    "extraction_regex": r"(TOKEN-[A-Z]+)",
+                    "confidence": 0.99,
+                    "evidence": "finalizer used the previously computed artifact",
+                },
+            )
+            game.messages = FakeMessages(
+                [
+                    SimpleNamespace(content=[first]),
+                    SimpleNamespace(content=[second]),
+                    SimpleNamespace(content=[third]),
+                ]
+            )
+            game.client = SimpleNamespace(messages=game.messages)
+            solver = TileSolver(game, max_turns=2)
+            result = solver.solve(
+                Tile(id="PR-C3", category="Cryptic", points=300),
+                recipe_generation=0,
+            )
+            self.assertIsNotNone(result)
+            self.assertEqual(result.answer, "TOKEN-FINAL")
+            self.assertEqual(len(game.messages.calls), 3)
+            self.assertEqual(
+                [tool["name"] for tool in game.messages.calls[-1]["tools"]],
+                ["record_answer"],
+            )
+            self.assertTrue(
+                any("finalizer=1" in message for message in game.logs)
+            )
 
     def test_turn_budget_is_tier_aware(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -602,6 +703,71 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             record, "solver produced no candidate", recoverable=True
         )
         self.assertEqual(record.status, TileStatus.FAILED)
+
+    async def test_exhausted_recipe_family_is_temporarily_deprioritized(self) -> None:
+        controller = self._controller_for_unit_tests()
+        exhausted = TileRecord(Tile("PR-S3-a", "Ship It", 300))
+        sibling = TileRecord(Tile("PR-S3-b", "Ship It", 300))
+        unrelated = TileRecord(Tile("PR-N3-a", "Needle in the Haystack", 300))
+        controller.records = {
+            record.tile.id: record
+            for record in (exhausted, sibling, unrelated)
+        }
+        delay = controller._defer_recipe_after_exhaustion(exhausted)
+        selected = controller._select_records([sibling, unrelated], room=1)
+        self.assertEqual(delay, controller.config.recipe_backoff_seconds)
+        self.assertEqual(selected[0].tile.id, unrelated.tile.id)
+
+    async def test_scored_replay_requires_practice_variant_validation(self) -> None:
+        controller = self._controller_for_unit_tests()
+        fingerprint = "gf1:" + ("a" * 64)
+        recipe = ReplayRecipe(
+            code='print("TOKEN-OK")',
+            generator_fingerprint=fingerprint,
+            fingerprint_version=1,
+            answer_format="exact",
+            scheduler_key="Ship It:200",
+        )
+        controller.replay_cache.store(recipe)
+
+        controller.phase = "round1"
+        self.assertFalse(controller._replay_allowed(fingerprint))
+
+        controller.phase = "practice"
+        self.assertTrue(controller._replay_allowed(fingerprint))
+
+        controller.phase = "round1"
+        controller.replay_validations[fingerprint] = 1
+        self.assertTrue(controller._replay_allowed(fingerprint))
+
+    async def test_incorrect_replay_invalidates_only_its_fingerprint(self) -> None:
+        controller = self._controller_for_unit_tests()
+        scheduler_key = "Cryptic:500"
+        first_fingerprint = "gf1:" + ("a" * 64)
+        second_fingerprint = "gf1:" + ("b" * 64)
+        for fingerprint in (first_fingerprint, second_fingerprint):
+            controller.replay_cache.store(
+                ReplayRecipe(
+                    code='print("TOKEN-OK")',
+                    generator_fingerprint=fingerprint,
+                    fingerprint_version=1,
+                    answer_format="exact",
+                    scheduler_key=scheduler_key,
+                )
+            )
+        tile = Tile("Q-C5-a", "Cryptic", 500)
+        controller.records[tile.id] = TileRecord(
+            tile=tile, status=TileStatus.CANDIDATE, attempts=1
+        )
+        failed = replace(
+            candidate(task_id=tile.id),
+            generator_fingerprint=first_fingerprint,
+        )
+
+        await controller._on_submission_result(failed, {"result": "incorrect"})
+
+        self.assertIsNone(controller.replay_cache.lookup(first_fingerprint))
+        self.assertIsNotNone(controller.replay_cache.lookup(second_fingerprint))
 
     async def test_terminal_fast_path_miss_is_not_retried(self) -> None:
         controller = self._controller_for_unit_tests()

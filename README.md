@@ -160,12 +160,12 @@ The model is never given a submit tool. It must use task tools and finish with
 `record_answer`; the controller validates that candidate and resolves
 artifact-backed answers without asking the model to retype exact tokens.
 
-Before constructing the Anthropic client, the solver tries any already
-validated replay recipe and then fingerprints the task title, prompt markers,
-extensions, schemas, archive members, and magic bytes. Stable generated
-families can be solved deterministically; malformed or ambiguous inputs fall
-through to Claude. Set `FAST_PATH_ONLY=1` with `DRY_RUN=1` to calibrate these
-paths while guaranteeing zero model calls.
+Before constructing the Anthropic client, the solver fingerprints the prompt
+template, title/category/answer format, filename patterns, schemas, archive
+layout, and magic bytes. It replays a learned recipe only on an exact match to
+that versioned generator fingerprint, then tries deterministic fast paths;
+malformed or ambiguous inputs fall through to Claude. Set `FAST_PATH_ONLY=1`
+with `DRY_RUN=1` to calibrate these paths while guaranteeing zero model calls.
 
 Model context is compact by construction. `inspect_file` returns table schemas,
 JSON shapes, log counts, and small samples; searches return bounded matches;
@@ -179,6 +179,12 @@ Subprocess stdout and stderr are spooled to bounded temporary files before they
 enter memory, and isolated Python runs explicitly include the task workspace so
 extracted packages remain importable. Solver budgets scale from 8 turns on the
 fast tiers to 12 on 500s; no-candidate exhaustion gets one deferred recovery.
+An additional record-only finalization turn can preserve an answer computed on
+the last normal turn. Exhausted generator families back off before consuming a
+sibling worker, and learned Python replays must produce identical output twice;
+scored phases only reuse fingerprint recipes validated on a practice sibling.
+An incorrect replay invalidates only that exact fingerprint, not every recipe
+in its category and point tier.
 The scheduler reserves half its workers for 400/500 exploration and uses the
 rest for faster tiers. Unreplayed scored 400/500 candidates must also carry a
 separate verification artifact before the submission lane accepts them.

@@ -67,6 +67,79 @@ class ReplayRecipe:
     code: str
     extraction_regex: str = ""
     regex_group: int = 1
+    generator_fingerprint: str = ""
+    fingerprint_version: int = 0
+    answer_format: str = ""
+    scheduler_key: str = ""
+
+    def compatible_with(
+        self,
+        generator_fingerprint: str,
+        fingerprint_version: int,
+        answer_format: str,
+    ) -> bool:
+        return (
+            bool(self.generator_fingerprint)
+            and self.generator_fingerprint == generator_fingerprint
+            and self.fingerprint_version == fingerprint_version
+            and self.answer_format == answer_format
+        )
+
+
+class ReplayRecipeCache:
+    """Thread-safe recipes keyed by a structural generator fingerprint."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._recipes: dict[str, ReplayRecipe] = {}
+        self._scheduler_groups: dict[str, set[str]] = {}
+
+    def lookup(self, generator_fingerprint: str) -> ReplayRecipe | None:
+        with self._lock:
+            return self._recipes.get(generator_fingerprint)
+
+    def store(self, recipe: ReplayRecipe) -> None:
+        if not recipe.generator_fingerprint:
+            raise ValueError("replay recipe has no generator fingerprint")
+        if not recipe.scheduler_key:
+            raise ValueError("replay recipe has no scheduler key")
+        with self._lock:
+            previous = self._recipes.get(recipe.generator_fingerprint)
+            if previous is not None and previous.scheduler_key != recipe.scheduler_key:
+                previous_group = self._scheduler_groups.get(previous.scheduler_key)
+                if previous_group is not None:
+                    previous_group.discard(recipe.generator_fingerprint)
+            self._recipes[recipe.generator_fingerprint] = recipe
+            self._scheduler_groups.setdefault(recipe.scheduler_key, set()).add(
+                recipe.generator_fingerprint
+            )
+
+    def discard(self, generator_fingerprint: str) -> None:
+        if not generator_fingerprint:
+            return
+        with self._lock:
+            recipe = self._recipes.pop(generator_fingerprint, None)
+            if recipe is None:
+                return
+            group = self._scheduler_groups.get(recipe.scheduler_key)
+            if group is not None:
+                group.discard(generator_fingerprint)
+                if not group:
+                    self._scheduler_groups.pop(recipe.scheduler_key, None)
+
+    def discard_scheduler_key(self, scheduler_key: str) -> None:
+        with self._lock:
+            fingerprints = self._scheduler_groups.pop(scheduler_key, set())
+            for fingerprint in fingerprints:
+                self._recipes.pop(fingerprint, None)
+
+    def has_scheduler_key(self, scheduler_key: str) -> bool:
+        with self._lock:
+            return bool(self._scheduler_groups.get(scheduler_key))
+
+    def fingerprints(self, scheduler_key: str) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._scheduler_groups.get(scheduler_key, set()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +183,7 @@ class Candidate:
     source: str
     strategy: str = "claude"
     verification_source: str = ""
+    generator_fingerprint: str = ""
     verified: bool = False
     verification_note: str = ""
     replay_recipe: ReplayRecipe | None = None

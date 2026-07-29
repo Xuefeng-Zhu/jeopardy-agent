@@ -1014,7 +1014,7 @@ class FastPathIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ClaudeReached):
                 solver.solve(tile, 1)
 
-    def test_registered_title_breaks_only_scheduler_ties(self) -> None:
+    def test_registered_title_outranks_higher_default_solve_priority(self) -> None:
         class Game:
             BASE = "https://example.test"
             MODEL = "unused"
@@ -1024,11 +1024,92 @@ class FastPathIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         controller = AgentController(Game(), AgentConfig(model_workers=1))
-        ordinary = TileRecord(Tile("T-1", "Other", 100, "Ordinary"))
+        ordinary = TileRecord(Tile("T-1", "Other", 200, "Ordinary"))
         deterministic = TileRecord(
-            Tile("T-2", "Needle in the Haystack", 100, "Dirty Ledger")
+            Tile("T-2", "Needle in the Haystack", 500, "Dirty Ledger")
         )
         selected = controller._select_records([ordinary, deterministic], 1)
         self.assertEqual(selected[0].tile.id, "T-2")
         self.assertTrue(is_registered_fast_path_title("Dirty Ledger"))
         self.assertFalse(is_registered_fast_path_title("Ordinary"))
+
+    def test_generator_fingerprint_ignores_instance_values(self) -> None:
+        first, _ = FastPathFixtureTests.dispatch(
+            self,
+            title="Event Horizon",
+            category="Needle in the Haystack",
+            answer_format="exact_ci",
+            prompt=(
+                "Count events of type 'purchase' from 2026-01-01 through "
+                "2026-01-31 inclusive and return the unique winner among 50 users."
+            ),
+            files={
+                "events-001.jsonl": (
+                    '{"user":"a","type":"purchase","ts":"2026-01-02T00:00:00Z"}\n'
+                )
+            },
+        )
+        second, _ = FastPathFixtureTests.dispatch(
+            self,
+            title="Event Horizon",
+            category="Needle in the Haystack",
+            answer_format="exact_ci",
+            prompt=(
+                "Count events of type 'refund' from 2026-02-01 through "
+                "2026-02-28 inclusive and return the unique winner among 75 users."
+            ),
+            files={
+                "events-002.jsonl": (
+                    '{"user":"b","type":"refund","ts":"2026-02-03T00:00:00Z"}\n'
+                )
+            },
+        )
+
+        self.assertEqual(
+            first.fingerprint.generator_fingerprint,
+            second.fingerprint.generator_fingerprint,
+        )
+
+    def test_generator_fingerprint_rejects_structural_near_matches(self) -> None:
+        baseline, _ = FastPathFixtureTests.dispatch(
+            self,
+            title="Hidden Pixels",
+            category="Cryptic",
+            answer_format="exact",
+            prompt="Inspect the PNG chunks and return the unique token.",
+            files={"image-01.dat": b"\x89PNG\r\n\x1a\n"},
+        )
+        wrong_magic, _ = FastPathFixtureTests.dispatch(
+            self,
+            title="Hidden Pixels",
+            category="Cryptic",
+            answer_format="exact",
+            prompt="Inspect the PNG chunks and return the unique token.",
+            files={"image-02.dat": "validator text"},
+        )
+        wrong_schema, _ = FastPathFixtureTests.dispatch(
+            self,
+            title="Hidden Pixels",
+            category="Cryptic",
+            answer_format="exact",
+            prompt="Inspect the PNG chunks and return the unique token.",
+            files={"image-03.dat": b"\x89PNG\r\n\x1a\n", "extra.csv": "other\n1\n"},
+        )
+        wrong_format, _ = FastPathFixtureTests.dispatch(
+            self,
+            title="Hidden Pixels",
+            category="Cryptic",
+            answer_format="numeric",
+            prompt="Inspect the PNG chunks and return the unique token.",
+            files={"image-04.dat": b"\x89PNG\r\n\x1a\n"},
+        )
+        fingerprint = baseline.fingerprint.generator_fingerprint
+        self.assertNotEqual(
+            fingerprint, wrong_magic.fingerprint.generator_fingerprint
+        )
+        self.assertNotEqual(
+            fingerprint, wrong_schema.fingerprint.generator_fingerprint
+        )
+        self.assertNotEqual(
+            fingerprint, wrong_format.fingerprint.generator_fingerprint
+        )

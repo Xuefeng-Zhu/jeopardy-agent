@@ -12,7 +12,7 @@ from typing import Any
 from agent_types import (
     CancellationToken,
     Candidate,
-    ReplayRecipe,
+    ReplayRecipeCache,
     SolveCancelled,
     Tile,
     TileRecord,
@@ -40,6 +40,7 @@ class AgentConfig:
     max_tokens: int = 1800
     max_attempts: int = 3
     recovery_attempts: int = 1
+    recipe_backoff_seconds: float = 30.0
     board_poll_seconds: float = 2.0
     submit_interval: float = 3.15
     minimum_confidence: float = 0.82
@@ -66,6 +67,9 @@ class AgentConfig:
             max_attempts=max(1, int(os.environ.get("MAX_ATTEMPTS", "3"))),
             recovery_attempts=max(
                 0, int(os.environ.get("RECOVERY_ATTEMPTS", "1"))
+            ),
+            recipe_backoff_seconds=max(
+                5.0, float(os.environ.get("RECIPE_BACKOFF_SECONDS", "30"))
             ),
             board_poll_seconds=max(
                 0.5, float(os.environ.get("BOARD_POLL_SECONDS", "2"))
@@ -333,6 +337,8 @@ class AgentController:
         self.config = config
         self.gate = RecipeGate()
         self.verifier = CandidateVerifier(config.minimum_confidence)
+        self.replay_cache = ReplayRecipeCache()
+        self.replay_validations: dict[str, int] = {}
         self.solver = TileSolver(
             game,
             max_turns=config.max_turns,
@@ -340,9 +346,12 @@ class AgentController:
             verbose=config.verbose,
             fast_paths=config.fast_paths,
             fast_path_only=config.fast_path_only,
+            replay_cache=self.replay_cache,
+            replay_allowed=self._replay_allowed,
         )
         self.records: dict[str, TileRecord] = {}
-        self.replay_recipes: dict[str, ReplayRecipe] = {}
+        self._recipe_backoff_until: dict[str, float] = {}
+        self._recipe_exhaustions: dict[str, int] = {}
         self.open_ids: set[str] = set()
         self.phase = ""
         self._active: dict[str, asyncio.Task[None]] = {}
@@ -400,6 +409,8 @@ class AgentController:
         if phase != self.phase:
             self.phase = phase
             self.gate.set_phase(phase)
+            self._recipe_backoff_until.clear()
+            self._recipe_exhaustions.clear()
             self.game.log(f"phase changed to {phase!r}")
 
         raw_tiles = list(self.game.open_tiles(board))
@@ -480,9 +491,9 @@ class AgentController:
         ranked = sorted(
             eligible,
             key=lambda record: (
+                int(is_registered_fast_path_title(record.tile.title)),
                 self._solve_priority(record),
                 record.tile.points,
-                int(is_registered_fast_path_title(record.tile.title)),
             ),
             reverse=True,
         )
@@ -501,10 +512,13 @@ class AgentController:
         )
         high_limit = max(1, self.config.model_workers // 2)
         high_slots = max(0, min(room, high_limit - active_high))
+        now = time.monotonic()
 
         def can_select(record: TileRecord) -> bool:
             recipe_key = record.tile.recipe_key
-            has_replay = recipe_key in self.replay_recipes
+            if self._recipe_backoff_until.get(recipe_key, 0.0) > now:
+                return False
+            has_replay = self.replay_cache.has_scheduler_key(recipe_key)
             has_success = self.gate.state(recipe_key).successes > 0
             return not (
                 not has_replay
@@ -522,10 +536,19 @@ class AgentController:
                 selected_recipes.add(record.tile.recipe_key)
                 limit -= 1
 
+        deterministic = [
+            record
+            for record in ranked
+            if is_registered_fast_path_title(record.tile.title)
+        ]
+        take(deterministic, room)
+
+        selected_high = sum(record.tile.points >= 400 for record in selected)
+        high_slots = max(0, high_slots - selected_high)
         high = [record for record in ranked if record.tile.points >= 400]
-        fast = [record for record in ranked if record.tile.points < 400]
+        lower_tier = [record for record in ranked if record.tile.points < 400]
         take(high, high_slots)
-        take(fast, room - len(selected))
+        take(lower_tier, room - len(selected))
         take(ranked, room - len(selected))
         return selected
 
@@ -548,11 +571,16 @@ class AgentController:
         self._active.pop(task_id, None)
         self._cancel_tokens.pop(task_id, None)
 
+    def _replay_allowed(self, generator_fingerprint: str) -> bool:
+        return (
+            self.phase == "practice"
+            or self.replay_validations.get(generator_fingerprint, 0) >= 1
+        )
+
     async def _solve(self, record: TileRecord, cancellation: CancellationToken) -> None:
         record.status = TileStatus.SOLVING
         record.attempts += 1
         generation = self.gate.generation(record.tile.recipe_key)
-        replay_recipe = self.replay_recipes.get(record.tile.recipe_key)
         self.game.log(
             f"{record.tile.id}: solving {record.tile.category} "
             f"{record.tile.points}pt attempt={record.attempts}"
@@ -562,7 +590,7 @@ class AgentController:
                 self.solver.solve,
                 record.tile,
                 generation,
-                replay_recipe,
+                None,
                 cancellation,
                 attempt=record.attempts,
             )
@@ -584,9 +612,11 @@ class AgentController:
             return
 
         if candidate is None:
+            delay = self._defer_recipe_after_exhaustion(record)
             self._retry_or_fail(
                 record,
                 "solver produced no candidate",
+                delay=delay,
                 recoverable=not self.config.fast_path_only,
                 terminal=self.config.fast_path_only,
             )
@@ -620,6 +650,26 @@ class AgentController:
             f"confidence={candidate.confidence:.2f} source={candidate.source}"
         )
         await self.submitter.enqueue(candidate)
+
+    def _defer_recipe_after_exhaustion(self, record: TileRecord) -> float:
+        """Avoid spending adjacent workers on the same recently exhausted family."""
+
+        recipe_key = record.tile.recipe_key
+        failures = self._recipe_exhaustions.get(recipe_key, 0) + 1
+        self._recipe_exhaustions[recipe_key] = failures
+        delay = min(
+            120.0,
+            self.config.recipe_backoff_seconds * (2 ** max(0, failures - 1)),
+        )
+        self._recipe_backoff_until[recipe_key] = max(
+            self._recipe_backoff_until.get(recipe_key, 0.0),
+            time.monotonic() + delay,
+        )
+        self.game.log(
+            f"{record.tile.id}: recipe family deferred for {delay:.1f}s "
+            f"after exhaustion count={failures}"
+        )
+        return delay
 
     def _retry_or_fail(
         self,
@@ -672,12 +722,23 @@ class AgentController:
         self.game.log(f"{candidate.task_id}: submission -> {outcome or result!r}")
 
         if outcome == "correct":
-            if candidate.replay_recipe is not None:
-                self.replay_recipes[candidate.recipe_key] = candidate.replay_recipe
-            elif not candidate.replayed:
-                # A cached script that fell back to a non-replay solution is no
-                # longer useful for this generator.
-                self.replay_recipes.pop(candidate.recipe_key, None)
+            self._recipe_backoff_until.pop(candidate.recipe_key, None)
+            self._recipe_exhaustions.pop(candidate.recipe_key, None)
+            if candidate.replayed:
+                fingerprint = candidate.generator_fingerprint
+                if fingerprint:
+                    self.replay_validations[fingerprint] = (
+                        self.replay_validations.get(fingerprint, 0) + 1
+                    )
+            elif candidate.replay_recipe is not None:
+                previous = self.replay_cache.lookup(
+                    candidate.replay_recipe.generator_fingerprint
+                )
+                if previous != candidate.replay_recipe:
+                    self.replay_validations[
+                        candidate.replay_recipe.generator_fingerprint
+                    ] = 0
+                self.replay_cache.store(candidate.replay_recipe)
             record.status = TileStatus.SOLVED
             record.candidate = None
             self.open_ids.discard(candidate.task_id)
@@ -693,7 +754,8 @@ class AgentController:
             self.open_ids.discard(candidate.task_id)
             return
         if outcome == "incorrect":
-            self.replay_recipes.pop(candidate.recipe_key, None)
+            self.replay_cache.discard(candidate.generator_fingerprint)
+            self.replay_validations.pop(candidate.generator_fingerprint, None)
             if candidate.strategy.startswith("fast:"):
                 handler = candidate.strategy.removeprefix("fast:")
                 next_generation = self.gate.generation(candidate.recipe_key)

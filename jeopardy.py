@@ -17,6 +17,7 @@ import os
 import pathlib
 import tempfile
 import time
+from threading import Lock
 
 import requests
 
@@ -29,6 +30,7 @@ if not BASE or not KEY:
 
 _s = requests.Session()
 _s.headers["X-Api-Key"] = KEY
+_log_lock = Lock()
 
 
 # ---------------------------------------------------------------- errors
@@ -289,4 +291,5 @@ MODEL = os.environ.get("MODEL", "claude-haiku-4-5")
 
 
 def log(*a):
-    print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+    with _log_lock:
+        print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)

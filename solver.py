@@ -5,11 +5,19 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from collections.abc import Callable
+from dataclasses import replace
 from threading import Lock
 from typing import Any
 
-from agent_types import CancellationToken, Candidate, ReplayRecipe, Tile
-from fast_paths import FastPathDispatcher, FastPathStatus
+from agent_types import (
+    CancellationToken,
+    Candidate,
+    ReplayRecipe,
+    ReplayRecipeCache,
+    Tile,
+)
+from fast_paths import FastPathDispatcher, FastPathStatus, TaskFingerprint
 from tool_runtime import TOOL_SCHEMAS, TaskToolRuntime
 
 CATEGORY_PLAYBOOKS = {
@@ -67,6 +75,17 @@ Rules:
   a candidate is safe enough to submit.
 """
 
+FINALIZATION_SYSTEM_PROMPT = """
+
+This is the single finalization turn. Do not perform more investigation.
+Use the evidence and artifacts already present. Call record_answer only when
+they support a concrete answer; otherwise stop without inventing one.
+"""
+
+FINALIZATION_TOOLS = [
+    schema for schema in TOOL_SCHEMAS if schema.get("name") == "record_answer"
+]
+
 
 class TileSolver:
     def __init__(
@@ -78,6 +97,8 @@ class TileSolver:
         verbose: bool = False,
         fast_paths: bool = True,
         fast_path_only: bool = False,
+        replay_cache: ReplayRecipeCache | None = None,
+        replay_allowed: Callable[[str], bool] | None = None,
     ) -> None:
         self.game = game
         self.max_turns = max(2, max_turns)
@@ -86,6 +107,8 @@ class TileSolver:
         self.fast_paths_enabled = fast_paths or fast_path_only
         self.fast_path_only = fast_path_only
         self.fast_path_dispatcher = FastPathDispatcher()
+        self.replay_cache = replay_cache or ReplayRecipeCache()
+        self.replay_allowed = replay_allowed or (lambda _fingerprint: True)
         self._disabled_fast_paths: dict[tuple[str, int], set[str]] = {}
         self._disabled_fast_paths_lock = Lock()
 
@@ -134,8 +157,33 @@ class TileSolver:
 
         answer_format = str(detail.get("answer_format") or "exact")
         category = str(detail.get("category") or tile.category)
-        if replay_recipe is not None:
-            replayed = self._try_replay(runtime, replay_recipe)
+        fingerprint = TaskFingerprint.build(
+            tile, detail, names, runtime.root, cancellation
+        )
+        self.game.log(f"{tile.id}: fingerprint {fingerprint.compact_summary()}")
+        generator_fingerprint = fingerprint.generator_fingerprint
+        compatible_recipe = None
+        if replay_recipe is not None and replay_recipe.compatible_with(
+            generator_fingerprint,
+            fingerprint.fingerprint_version,
+            answer_format,
+        ):
+            compatible_recipe = replay_recipe
+        elif replay_recipe is not None:
+            self.game.log(
+                f"{tile.id}: skipped incompatible or legacy replay recipe"
+            )
+        if compatible_recipe is None and self.replay_allowed(generator_fingerprint):
+            cached = self.replay_cache.lookup(generator_fingerprint)
+            if cached is not None and cached.compatible_with(
+                generator_fingerprint,
+                fingerprint.fingerprint_version,
+                answer_format,
+            ):
+                compatible_recipe = cached
+
+        if compatible_recipe is not None:
+            replayed = self._try_replay(runtime, compatible_recipe)
             if replayed is not None:
                 self.game.log(f"{tile.id}: reused a previously correct Python recipe")
                 return Candidate(
@@ -153,13 +201,15 @@ class TileSolver:
                     ),
                     source=replayed.source,
                     strategy="replay",
-                    verification_source="trusted-replay",
-                    replay_recipe=replay_recipe,
+                    verification_source=replayed.verification_source,
+                    generator_fingerprint=generator_fingerprint,
+                    replay_recipe=compatible_recipe,
                     replayed=True,
                 )
+            self.replay_cache.discard(generator_fingerprint)
             self.game.log(
                 f"{tile.id}: cached recipe did not produce a candidate; "
-                "continuing to deterministic fingerprinting"
+                "discarding this fingerprint recipe and continuing"
             )
 
         if self.fast_paths_enabled:
@@ -171,12 +221,8 @@ class TileSolver:
                 disabled_handlers=self._disabled_handlers(
                     tile.recipe_key, recipe_generation
                 ),
+                fingerprint=fingerprint,
             )
-            if outcome.fingerprint is not None:
-                self.game.log(
-                    f"{tile.id}: fast fingerprint "
-                    f"{outcome.fingerprint.compact_summary()}"
-                )
             self.game.log(
                 f"{tile.id}: fast path handler={outcome.handler or 'none'} "
                 f"outcome={outcome.status.value} "
@@ -196,6 +242,7 @@ class TileSolver:
                     source=outcome.source,
                     strategy=f"fast:{outcome.handler}",
                     verification_source=outcome.verification_source,
+                    generator_fingerprint=generator_fingerprint,
                 )
             self.game.log(
                 f"{tile.id}: deterministic fallback reason={outcome.reason}"
@@ -245,15 +292,23 @@ class TileSolver:
         input_tokens = 0
         output_tokens = 0
         stop_reasons: list[str] = []
-        for turn in range(1, turn_budget + 1):
+        final_turn = turn_budget + 1
+        for turn in range(1, final_turn + 1):
             cancellation.check()
             self._compact_history(messages)
+            finalizing = turn == final_turn
             request = {
                 "model": self.game.MODEL,
-                "max_tokens": self.max_tokens,
+                "max_tokens": min(self.max_tokens, 768)
+                if finalizing
+                else self.max_tokens,
                 "temperature": 0,
-                "system": BASE_SYSTEM_PROMPT,
-                "tools": TOOL_SCHEMAS,
+                "system": (
+                    BASE_SYSTEM_PROMPT + FINALIZATION_SYSTEM_PROMPT
+                    if finalizing
+                    else BASE_SYSTEM_PROMPT
+                ),
+                "tools": FINALIZATION_TOOLS if finalizing else TOOL_SCHEMAS,
                 "messages": messages,
             }
             response = self._model_call(client, request, cancellation)
@@ -298,6 +353,17 @@ class TileSolver:
 
             if runtime.recorded_answer is not None:
                 recorded = runtime.recorded_answer
+                recorded_recipe = (
+                    replace(
+                        recorded.replay_recipe,
+                        generator_fingerprint=generator_fingerprint,
+                        fingerprint_version=fingerprint.fingerprint_version,
+                        answer_format=answer_format,
+                        scheduler_key=tile.recipe_key,
+                    )
+                    if recorded.replay_recipe is not None
+                    else None
+                )
                 self._log_summary(
                     tile.id,
                     turn,
@@ -308,6 +374,7 @@ class TileSolver:
                     output_tokens,
                     stop_reasons,
                     "recorded",
+                    finalizing=finalizing,
                 )
                 return Candidate(
                     task_id=tile.id,
@@ -322,7 +389,8 @@ class TileSolver:
                     source=recorded.source,
                     strategy="claude",
                     verification_source=recorded.verification_source,
-                    replay_recipe=recorded.replay_recipe,
+                    generator_fingerprint=generator_fingerprint,
+                    replay_recipe=recorded_recipe,
                 )
 
             if tool_results:
@@ -343,7 +411,7 @@ class TileSolver:
 
         self._log_summary(
             tile.id,
-            turn_budget,
+            final_turn,
             turn_budget,
             tool_counts,
             tool_errors,
@@ -351,6 +419,7 @@ class TileSolver:
             output_tokens,
             stop_reasons,
             "exhausted",
+            finalizing=True,
         )
         return None
 
@@ -372,6 +441,8 @@ class TileSolver:
         output_tokens: int,
         stop_reasons: list[str],
         outcome: str,
+        *,
+        finalizing: bool = False,
     ) -> None:
         tools = ",".join(
             f"{name}:{count}" for name, count in sorted(tool_counts.items())
@@ -380,7 +451,8 @@ class TileSolver:
         self.game.log(
             f"{task_id}: solver summary outcome={outcome} turns={turns}/{budget} "
             f"tools={tools} tool_errors={tool_errors} "
-            f"tokens_in={input_tokens} tokens_out={output_tokens} stops={stops}"
+            f"tokens_in={input_tokens} tokens_out={output_tokens} stops={stops} "
+            f"finalizer={int(finalizing)}"
         )
 
     @staticmethod
@@ -446,18 +518,32 @@ class TileSolver:
 
     @staticmethod
     def _try_replay(runtime: TaskToolRuntime, recipe: ReplayRecipe):
-        run_result = json.loads(
+        first = json.loads(
             runtime.execute("run_python", {"code": recipe.code, "timeout": 30})
         )
-        if not run_result.get("ok") or run_result.get("returncode") != 0:
+        second = json.loads(
+            runtime.execute("run_python", {"code": recipe.code, "timeout": 30})
+        )
+        for result in (first, second):
+            if (
+                not result.get("ok")
+                or result.get("returncode") != 0
+                or result.get("stdout_artifact_truncated")
+            ):
+                return None
+        first_artifact = first.get("stdout_artifact")
+        second_artifact = second.get("stdout_artifact")
+        if not first_artifact or not second_artifact:
             return None
-        artifact_id = run_result.get("stdout_artifact")
-        if not artifact_id:
+        if runtime.artifacts.get(first_artifact) != runtime.artifacts.get(
+            second_artifact
+        ):
             return None
         record_arguments: dict[str, Any] = {
-            "artifact_id": artifact_id,
+            "artifact_id": first_artifact,
+            "verification_artifact_id": second_artifact,
             "confidence": 0.99,
-            "evidence": "cached recipe replay",
+            "evidence": "cached recipe replay produced identical output twice",
         }
         if recipe.extraction_regex:
             record_arguments["extraction_regex"] = recipe.extraction_regex
