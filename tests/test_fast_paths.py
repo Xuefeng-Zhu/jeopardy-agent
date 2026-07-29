@@ -12,6 +12,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urljoin
 from zipfile import ZipFile
 
 import fast_paths
@@ -109,6 +110,81 @@ class FastPathFixtureTests(unittest.TestCase):
         self.assertNotEqual(outcome.source, outcome.verification_source)
         artifact_id = outcome.source.removeprefix("artifact:")
         self.assertEqual(runtime.artifacts.get(artifact_id), answer)
+
+    def test_bounded_web_trail_replays_one_session(self) -> None:
+        calls: list[dict] = []
+
+        def fake_execute(runtime, name, arguments):
+            self.assertEqual(name, "http_request")
+            calls.append(arguments)
+            url = str(arguments["url"])
+            if url.endswith("/trail/start"):
+                body = '<html><a href="/trail/next">next</a></html>'
+                resolved = "https://example.test/trail/start"
+            elif url.endswith("/trail/next"):
+                body = "<html>Final token: CRUMB-ABC123</html>"
+                resolved = "https://example.test/trail/next"
+            else:
+                return json.dumps({"ok": False, "error": "unexpected URL"})
+            artifact_id = runtime.artifacts.put(body)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": 200,
+                    "url": resolved,
+                    "body_artifact": artifact_id,
+                }
+            )
+
+        with patch.object(
+            TaskToolRuntime, "execute", autospec=True, side_effect=fake_execute
+        ):
+            outcome, runtime = self.dispatch(
+                title="Breadcrumbs",
+                category="The Dark Web",
+                answer_format="exact",
+                prompt=(
+                    "Begin at /trail/start and follow the breadcrumbs. "
+                    "The token begins with CRUMB-."
+                ),
+                files={},
+            )
+        self.assert_solved(outcome, runtime, "breadcrumbs", "CRUMB-ABC123")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({call["session"] for call in calls}, {"fast-breadcrumbs"})
+
+    def test_bounded_web_trail_rejects_ambiguous_tokens(self) -> None:
+        def fake_execute(runtime, _name, arguments):
+            body = (
+                "<html>Token: CRUMB-ABC123 "
+                "<a href='/trail/next'>next</a></html>"
+                if str(arguments["url"]).endswith("/start")
+                else "<html>Token: CRUMB-XYZ789</html>"
+            )
+            artifact_id = runtime.artifacts.put(body)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": 200,
+                    "url": urljoin(
+                        "https://example.test", str(arguments["url"])
+                    ),
+                    "body_artifact": artifact_id,
+                }
+            )
+
+        with patch.object(
+            TaskToolRuntime, "execute", autospec=True, side_effect=fake_execute
+        ):
+            outcome, _runtime = self.dispatch(
+                title="Deep Pages",
+                category="The Dark Web",
+                answer_format="exact",
+                prompt="Start at /start and return the unique token.",
+                files={},
+            )
+        self.assertEqual(outcome.status, FastPathStatus.INCONCLUSIVE)
+        self.assertIn("deterministic invariant failed", outcome.reason)
 
     def test_data_family_handlers(self) -> None:
         cases = [

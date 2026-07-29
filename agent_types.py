@@ -109,6 +109,8 @@ class ReplayRecipeCache:
                 previous_group = self._scheduler_groups.get(previous.scheduler_key)
                 if previous_group is not None:
                     previous_group.discard(recipe.generator_fingerprint)
+                    if not previous_group:
+                        self._scheduler_groups.pop(previous.scheduler_key, None)
             self._recipes[recipe.generator_fingerprint] = recipe
             self._scheduler_groups.setdefault(recipe.scheduler_key, set()).add(
                 recipe.generator_fingerprint
@@ -126,12 +128,6 @@ class ReplayRecipeCache:
                 group.discard(generator_fingerprint)
                 if not group:
                     self._scheduler_groups.pop(recipe.scheduler_key, None)
-
-    def discard_scheduler_key(self, scheduler_key: str) -> None:
-        with self._lock:
-            fingerprints = self._scheduler_groups.pop(scheduler_key, set())
-            for fingerprint in fingerprints:
-                self._recipes.pop(fingerprint, None)
 
     def has_scheduler_key(self, scheduler_key: str) -> bool:
         with self._lock:

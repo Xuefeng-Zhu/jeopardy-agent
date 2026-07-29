@@ -352,6 +352,7 @@ class AgentController:
         self.records: dict[str, TileRecord] = {}
         self._recipe_backoff_until: dict[str, float] = {}
         self._recipe_exhaustions: dict[str, int] = {}
+        self._family_failure_hints: dict[str, str] = {}
         self.open_ids: set[str] = set()
         self.phase = ""
         self._active: dict[str, asyncio.Task[None]] = {}
@@ -411,6 +412,7 @@ class AgentController:
             self.gate.set_phase(phase)
             self._recipe_backoff_until.clear()
             self._recipe_exhaustions.clear()
+            self._family_failure_hints.clear()
             self.game.log(f"phase changed to {phase!r}")
 
         raw_tiles = list(self.game.open_tiles(board))
@@ -586,14 +588,28 @@ class AgentController:
             f"{record.tile.points}pt attempt={record.attempts}"
         )
         try:
-            candidate = await asyncio.to_thread(
-                self.solver.solve,
-                record.tile,
-                generation,
-                None,
-                cancellation,
-                attempt=record.attempts,
+            family_failure_hint = self._family_failure_hints.get(
+                record.tile.recipe_key, ""
             )
+            if family_failure_hint:
+                candidate = await asyncio.to_thread(
+                    self.solver.solve,
+                    record.tile,
+                    generation,
+                    None,
+                    cancellation,
+                    attempt=record.attempts,
+                    family_failure_hint=family_failure_hint,
+                )
+            else:
+                candidate = await asyncio.to_thread(
+                    self.solver.solve,
+                    record.tile,
+                    generation,
+                    None,
+                    cancellation,
+                    attempt=record.attempts,
+                )
             cancellation.check()
         except SolveCancelled as exc:
             self.game.log(f"{record.tile.id}: solve cancelled: {exc}")
@@ -612,6 +628,13 @@ class AgentController:
             return
 
         if candidate is None:
+            report_getter = getattr(self.solver, "pop_failure_report", None)
+            report = report_getter(record.tile.id) if callable(report_getter) else ""
+            if report:
+                self._family_failure_hints[record.tile.recipe_key] = report
+                self.game.log(
+                    f"{record.tile.id}: stored compact failure strategy for siblings"
+                )
             delay = self._defer_recipe_after_exhaustion(record)
             self._retry_or_fail(
                 record,
@@ -724,6 +747,7 @@ class AgentController:
         if outcome == "correct":
             self._recipe_backoff_until.pop(candidate.recipe_key, None)
             self._recipe_exhaustions.pop(candidate.recipe_key, None)
+            self._family_failure_hints.pop(candidate.recipe_key, None)
             if candidate.replayed:
                 fingerprint = candidate.generator_fingerprint
                 if fingerprint:
@@ -754,6 +778,10 @@ class AgentController:
             self.open_ids.discard(candidate.task_id)
             return
         if outcome == "incorrect":
+            self._family_failure_hints[candidate.recipe_key] = (
+                f"submission strategy={candidate.strategy} was incorrect; "
+                "do not reuse that exact approach or candidate derivation"
+            )
             self.replay_cache.discard(candidate.generator_fingerprint)
             self.replay_validations.pop(candidate.generator_fingerprint, None)
             if candidate.strategy.startswith("fast:"):

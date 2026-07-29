@@ -8,16 +8,20 @@ results as artifacts so answers do not have to be retyped by the model.
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -30,6 +34,8 @@ MAX_TOOL_RESPONSE = 8_000
 MAX_TOOL_SAMPLE = 4_000
 MAX_ARTIFACT_TEXT = 250_000
 MAX_READ_PER_FILE = 12_000
+MAX_ARCHIVE_FILES = 256
+MAX_ARCHIVE_EXPANDED = 16_000_000
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -157,6 +163,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "content": {"type": "string", "maxLength": 200000},
             },
             "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "extract_archive",
+        "description": (
+            "Safely extract a ZIP, TAR, TAR.GZ, TGZ, or GZ file inside the task "
+            "workspace. Rejects links, path traversal, too many files, and more "
+            "than 16 MB of expanded data. Use this before inspecting repair tasks."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "output_dir": {"type": "string", "default": "extracted"},
+            },
+            "required": ["path"],
             "additionalProperties": False,
         },
     },
@@ -297,6 +320,18 @@ class ArtifactStore:
         except KeyError as exc:
             raise ValueError(f"unknown artifact {artifact_id!r}") from exc
 
+    def recent(self, limit: int = 6, preview_chars: int = 500) -> list[dict[str, str]]:
+        """Return bounded previews for a compact finalization prompt."""
+
+        items = list(self._values.items())[-max(0, limit) :]
+        return [
+            {
+                "artifact_id": artifact_id,
+                "preview": value[: max(0, preview_chars)],
+            }
+            for artifact_id, value in items
+        ]
+
 
 class TaskToolRuntime:
     def __init__(
@@ -391,6 +426,139 @@ class TaskToolRuntime:
             "files": entries,
             "files_truncated": total_files > len(entries),
         }
+
+    def _tool_extract_archive(
+        self, path: str, output_dir: str = "extracted"
+    ) -> dict[str, Any]:
+        source = self._path(path)
+        destination = self._path(output_dir)
+        if not source.is_file():
+            raise ValueError(f"archive does not exist: {path}")
+        if destination == self.root:
+            raise ValueError("output_dir must be a task-workspace subdirectory")
+
+        if zipfile.is_zipfile(source):
+            files = self._extract_zip(source, destination)
+        elif tarfile.is_tarfile(source):
+            files = self._extract_tar(source, destination)
+        elif source.name.lower().endswith(".gz"):
+            files = self._extract_gzip(source, destination)
+        else:
+            raise ValueError("unsupported archive type")
+
+        return {
+            "output_dir": str(destination.relative_to(self.root)),
+            "file_count": len(files),
+            "total_bytes": sum(size for _name, size in files),
+            "files": [
+                {"path": name, "bytes": size} for name, size in files[:120]
+            ],
+            "files_truncated": len(files) > 120,
+        }
+
+    def _extract_zip(
+        self, source: Path, destination: Path
+    ) -> list[tuple[str, int]]:
+        with zipfile.ZipFile(source) as archive:
+            members = [member for member in archive.infolist() if not member.is_dir()]
+            if len(members) > MAX_ARCHIVE_FILES:
+                raise ValueError("archive exceeds file-count limit")
+            if sum(member.file_size for member in members) > MAX_ARCHIVE_EXPANDED:
+                raise ValueError("archive exceeds expanded-size limit")
+
+            targets: list[tuple[zipfile.ZipInfo, Path, str]] = []
+            for member in members:
+                self.cancellation.check()
+                if stat.S_ISLNK(member.external_attr >> 16):
+                    raise ValueError("archive links are not allowed")
+                target, relative = self._archive_target(destination, member.filename)
+                targets.append((member, target, relative))
+
+            destination.mkdir(parents=True, exist_ok=True)
+            extracted: list[tuple[str, int]] = []
+            for member, target, relative in targets:
+                self.cancellation.check()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as reader, target.open("wb") as writer:
+                    written = self._copy_bounded(reader, writer)
+                extracted.append((relative, written))
+            return extracted
+
+    def _extract_tar(
+        self, source: Path, destination: Path
+    ) -> list[tuple[str, int]]:
+        with tarfile.open(source, mode="r:*") as archive:
+            members = [member for member in archive.getmembers() if not member.isdir()]
+            if len(members) > MAX_ARCHIVE_FILES:
+                raise ValueError("archive exceeds file-count limit")
+            if any(not member.isreg() for member in members):
+                raise ValueError("archive links and special files are not allowed")
+            if sum(member.size for member in members) > MAX_ARCHIVE_EXPANDED:
+                raise ValueError("archive exceeds expanded-size limit")
+
+            targets: list[tuple[tarfile.TarInfo, Path, str]] = []
+            for member in members:
+                self.cancellation.check()
+                target, relative = self._archive_target(destination, member.name)
+                targets.append((member, target, relative))
+
+            destination.mkdir(parents=True, exist_ok=True)
+            extracted: list[tuple[str, int]] = []
+            for member, target, relative in targets:
+                self.cancellation.check()
+                reader = archive.extractfile(member)
+                if reader is None:
+                    raise ValueError(f"could not read archive member {member.name!r}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with reader, target.open("wb") as writer:
+                    written = self._copy_bounded(reader, writer)
+                extracted.append((relative, written))
+            return extracted
+
+    def _extract_gzip(
+        self, source: Path, destination: Path
+    ) -> list[tuple[str, int]]:
+        output_name = source.name[:-3]
+        if not output_name:
+            raise ValueError("gzip archive has no output filename")
+        target, relative = self._archive_target(destination, output_name)
+        destination.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(source, "rb") as reader, target.open("wb") as writer:
+            written = self._copy_bounded(reader, writer)
+        return [(relative, written)]
+
+    def _archive_target(
+        self, destination: Path, member_name: str
+    ) -> tuple[Path, str]:
+        normalized = member_name.replace("\\", "/")
+        pure = PurePosixPath(normalized)
+        if (
+            not normalized
+            or pure.is_absolute()
+            or ".." in pure.parts
+            or any(part in {"", "."} for part in pure.parts)
+        ):
+            raise ValueError("archive member path is unsafe")
+        target = (destination / Path(*pure.parts)).resolve()
+        try:
+            target.relative_to(destination)
+            target.relative_to(self.root)
+        except ValueError as exc:
+            raise ValueError("archive member escapes the output directory") from exc
+        return target, str(target.relative_to(self.root))
+
+    def _copy_bounded(self, reader: Any, writer: Any) -> int:
+        written = 0
+        while True:
+            self.cancellation.check()
+            chunk = reader.read(65_536)
+            if not chunk:
+                return written
+            written += len(chunk)
+            if written > MAX_ARCHIVE_EXPANDED:
+                raise ValueError("archive exceeds expanded-size limit")
+            writer.write(chunk)
 
     def _tool_inspect_file(self, path: str) -> dict[str, Any]:
         file_path = self._path(path)

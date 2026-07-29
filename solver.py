@@ -50,6 +50,37 @@ CATEGORY_PLAYBOOKS = {
     ),
 }
 
+TITLE_PLAYBOOKS = {
+    "deep pages": (
+        "Treat this as a bounded graph traversal. Reuse one named HTTP session, "
+        "queue each same-host link once, cap the crawl, and accept only one "
+        "explicitly labeled final token. Do not infer a token from page names."
+    ),
+    "breadcrumbs": (
+        "Replay the complete same-session HTTP chain programmatically. Preserve "
+        "cookies, follow each same-host breadcrumb once, and extract the exact "
+        "answer from the final response artifact."
+    ),
+    "needle in 2^44": (
+        "Parse every numeric constraint before computing. Reduce the 2^44 search "
+        "with meet-in-the-middle, baby-step/giant-step, or modular decomposition; "
+        "never enumerate the full domain. Validate the candidate against every "
+        "original constraint with a separate calculation."
+    ),
+    "traveling salesman": (
+        "Parse and validate the complete graph or coordinate set. Use deterministic "
+        "multi-start construction followed by 2-opt/3-opt improvement, verify that "
+        "the route is a permutation with the required endpoints, and recompute its "
+        "objective independently before recording the exact requested format."
+    ),
+    "quintuple fault": (
+        "Call extract_archive first when an archive is present, then list the "
+        "extracted tree. Run the strongest available tests once, cluster the five "
+        "root failures, make minimal targeted fixes, and rerun both focused and "
+        "full tests. Record only a verified requested artifact or token."
+    ),
+}
+
 
 BASE_SYSTEM_PROMPT = """You are an autonomous competition task solver.
 
@@ -111,6 +142,8 @@ class TileSolver:
         self.replay_allowed = replay_allowed or (lambda _fingerprint: True)
         self._disabled_fast_paths: dict[tuple[str, int], set[str]] = {}
         self._disabled_fast_paths_lock = Lock()
+        self._failure_reports: dict[str, str] = {}
+        self._failure_reports_lock = Lock()
 
     def disable_fast_path(
         self, recipe_key: str, recipe_generation: int, handler: str
@@ -138,6 +171,14 @@ class TileSolver:
                 self._disabled_fast_paths.get((recipe_key, recipe_generation), set())
             )
 
+    def pop_failure_report(self, task_id: str) -> str:
+        with self._failure_reports_lock:
+            return self._failure_reports.pop(task_id, "")
+
+    def _store_failure_report(self, task_id: str, report: str) -> None:
+        with self._failure_reports_lock:
+            self._failure_reports[task_id] = report[:1_200]
+
     def solve(
         self,
         tile: Tile,
@@ -145,7 +186,9 @@ class TileSolver:
         replay_recipe: ReplayRecipe | None = None,
         cancellation: CancellationToken | None = None,
         attempt: int = 1,
+        family_failure_hint: str = "",
     ) -> Candidate | None:
+        self.pop_failure_report(tile.id)
         cancellation = cancellation or CancellationToken()
         cancellation.check()
         detail = self.game.task(tile.id)
@@ -254,11 +297,15 @@ class TileSolver:
             )
             return None
 
-        playbook = CATEGORY_PLAYBOOKS.get(
-            category,
-            "Inspect the materials with tools, compute the result, and verify it.",
-        )
         task_prompt = str(detail.get("prompt") or "")
+        normalized_title = " ".join(str(detail.get("title") or tile.title).lower().split())
+        playbook = TITLE_PLAYBOOKS.get(
+            normalized_title,
+            CATEGORY_PLAYBOOKS.get(
+                category,
+                "Inspect the materials with tools, compute the result, and verify it.",
+            ),
+        )
         prompt = (
             f"Task id: {tile.id}\n"
             f"Category: {category}\n"
@@ -280,6 +327,13 @@ class TileSolver:
                 "files already in the workspace, choose a different approach, "
                 "and reserve the final turn for record_answer."
             )
+        if family_failure_hint:
+            prompt += (
+                "\n\nA sibling in this generator family exhausted with this compact "
+                f"report:\n{family_failure_hint[:1_200]}\n"
+                "Do not repeat the same failing tool sequence. Choose a materially "
+                "different approach and validate it before record_answer."
+            )
         if self.verbose:
             self.game.log(f"{tile.id} solver prompt:\n{prompt}\n---")
 
@@ -292,11 +346,27 @@ class TileSolver:
         input_tokens = 0
         output_tokens = 0
         stop_reasons: list[str] = []
+        record_errors: list[str] = []
+        last_turn_tools: list[str] = []
+        turns_used = 0
+        finalizer_used = False
         final_turn = turn_budget + 1
         for turn in range(1, final_turn + 1):
             cancellation.check()
-            self._compact_history(messages)
             finalizing = turn == final_turn
+            if finalizing:
+                if tool_counts["record_answer"] == 0:
+                    break
+                finalizer_used = True
+                messages = self._finalization_messages(
+                    tile,
+                    category,
+                    answer_format,
+                    runtime,
+                    record_errors,
+                )
+            else:
+                self._compact_history(messages)
             request = {
                 "model": self.game.MODEL,
                 "max_tokens": min(self.max_tokens, 768)
@@ -309,9 +379,10 @@ class TileSolver:
                     else BASE_SYSTEM_PROMPT
                 ),
                 "tools": FINALIZATION_TOOLS if finalizing else TOOL_SCHEMAS,
-                "messages": messages,
+                "messages": list(messages),
             }
             response = self._model_call(client, request, cancellation)
+            turns_used = turn
             usage = getattr(response, "usage", None)
             input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
             output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
@@ -323,20 +394,25 @@ class TileSolver:
             messages.append({"role": "assistant", "content": assistant_content})
 
             tool_results: list[dict[str, Any]] = []
+            turn_tools: list[str] = []
             for block in response.content:
                 cancellation.check()
                 if getattr(block, "type", None) != "tool_use":
                     continue
                 tool_name = str(block.name)
+                turn_tools.append(tool_name)
                 tool_input = dict(block.input or {})
                 result = runtime.execute(tool_name, tool_input)
                 tool_counts[tool_name] += 1
+                parsed_result: dict[str, Any] = {}
                 try:
                     parsed_result = json.loads(result)
                     if not parsed_result.get("ok", True):
                         tool_errors += 1
                 except (json.JSONDecodeError, AttributeError):
                     tool_errors += 1
+                if tool_name == "record_answer" and not parsed_result.get("ok"):
+                    record_errors.append(str(parsed_result.get("error") or result)[:500])
                 if self.verbose:
                     self.game.log(
                         f"{tile.id} turn={turn} tool={tool_name} "
@@ -350,6 +426,8 @@ class TileSolver:
                         "content": result,
                     }
                 )
+            if not finalizing:
+                last_turn_tools = turn_tools
 
             if runtime.recorded_answer is not None:
                 recorded = runtime.recorded_answer
@@ -411,7 +489,7 @@ class TileSolver:
 
         self._log_summary(
             tile.id,
-            final_turn,
+            turns_used,
             turn_budget,
             tool_counts,
             tool_errors,
@@ -419,7 +497,17 @@ class TileSolver:
             output_tokens,
             stop_reasons,
             "exhausted",
-            finalizing=True,
+            finalizing=finalizer_used,
+        )
+        tools = ",".join(
+            f"{name}:{count}" for name, count in sorted(tool_counts.items())
+        ) or "none"
+        last_tools = ",".join(last_turn_tools) or "none"
+        errors = " | ".join(record_errors[-2:]) or "none"
+        self._store_failure_report(
+            tile.id,
+            f"tools={tools}; last_turn_tools={last_tools}; "
+            f"record_answer_errors={errors}",
         )
         return None
 
@@ -429,6 +517,32 @@ class TileSolver:
         if points >= 400:
             return min(self.max_turns, 10)
         return min(self.max_turns, 8)
+
+    @staticmethod
+    def _finalization_messages(
+        tile: Tile,
+        category: str,
+        answer_format: str,
+        runtime: TaskToolRuntime,
+        record_errors: list[str],
+    ) -> list[dict[str, Any]]:
+        payload = {
+            "task_id": tile.id,
+            "category": category,
+            "answer_format": answer_format,
+            "recent_artifacts": runtime.artifacts.recent(),
+            "record_answer_errors": record_errors[-3:],
+        }
+        return [
+            {
+                "role": "user",
+                "content": (
+                    "Finalize from this bounded evidence snapshot. Call "
+                    "record_answer only if the evidence supports one exact answer.\n"
+                    + json.dumps(payload, ensure_ascii=False)
+                ),
+            }
+        ]
 
     def _log_summary(
         self,

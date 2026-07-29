@@ -24,14 +24,17 @@ import subprocess
 import sys
 import time
 import zlib
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Protocol
+from urllib.parse import urljoin, urlparse
 from zipfile import BadZipFile, ZipFile
+
+from bs4 import BeautifulSoup
 
 from agent_types import CancellationToken, SolveCancelled, Tile
 from tool_runtime import TaskToolRuntime
@@ -1143,7 +1146,90 @@ class ProofOfWorkHandler(BaseHandler):
         raise FastPathError("proof-of-work nonce search bound exhausted")
 
 
+class BoundedWebTrailHandler(BaseHandler):
+    """Replay a read-only, same-session link trail and extract one explicit token."""
+
+    category = "The Dark Web"
+    answer_formats = ("exact", "exact_ci")
+    timeout_seconds = 24.0
+    max_pages = 48
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, set())
+        prompt = context.fingerprint.prompt
+        starts = _web_trail_starts(prompt, context.runtime.base_url)
+        if not starts:
+            raise FastPathError("could not identify an event-host start URL")
+
+        queue = deque(starts)
+        seen: set[str] = set()
+        candidates: set[str] = set()
+        successful_pages = 0
+        while queue and len(seen) < self.max_pages:
+            context.check()
+            target = queue.popleft()
+            normalized = _normalized_web_url(target)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            raw_result = context.runtime.execute(
+                "http_request",
+                {
+                    "url": target,
+                    "session": f"fast-{self.name}",
+                    "method": "GET",
+                    "follow_redirects": True,
+                    "timeout": 5,
+                },
+            )
+            result = json.loads(raw_result)
+            if not result.get("ok"):
+                continue
+            status = int(result.get("status") or 0)
+            artifact_id = str(result.get("body_artifact") or "")
+            if status >= 400 or not artifact_id:
+                continue
+            body = context.runtime.artifacts.get(artifact_id)
+            successful_pages += 1
+            candidates.update(_explicit_web_tokens(body, prompt))
+
+            current = str(result.get("url") or target)
+            for link in _same_host_links(body, current, context.runtime.allowed_host):
+                if _normalized_web_url(link) not in seen:
+                    queue.append(link)
+
+        if queue:
+            raise FastPathError("web trail exceeded the bounded page limit")
+        if successful_pages == 0:
+            raise FastPathError("no web-trail page returned successfully")
+        if len(candidates) != 1:
+            raise FastPathError(
+                f"expected one explicit web token, found {len(candidates)}"
+            )
+        answer = next(iter(candidates))
+        return (
+            answer,
+            (
+                f"replayed one cookie-preserving trail across {successful_pages} "
+                "pages; exactly one explicitly labeled token remained"
+            ),
+            0.995,
+        )
+
+
+class DeepPagesHandler(BoundedWebTrailHandler):
+    name = "deep_pages"
+    title = "Deep Pages"
+
+
+class BreadcrumbsHandler(BoundedWebTrailHandler):
+    name = "breadcrumbs"
+    title = "Breadcrumbs"
+
+
 HANDLERS: tuple[FastPathHandler, ...] = (
+    DeepPagesHandler(),
+    BreadcrumbsHandler(),
     DirtyLedgerHandler(),
     EventHorizonHandler(),
     JoinTheDotsHandler(),
@@ -1258,6 +1344,102 @@ def is_registered_fast_path_title(title: str) -> bool:
     return _normalize(title) in REGISTERED_TITLES
 
 
+def _web_trail_starts(prompt: str, base_url: str) -> list[str]:
+    candidates = re.findall(r"https?://[^\s)\]}>'\"]+", prompt)
+    relative_patterns = (
+        r"(?:start(?:ing)?(?:\s+page)?|begin|visit|url|endpoint|path)"
+        r"\s*(?:is|at|:|=)?\s*[`'\"]?(/[A-Za-z0-9_./?=&%:+~-]+)"
+    )
+    candidates.extend(re.findall(relative_patterns, prompt, flags=re.IGNORECASE))
+    if not candidates:
+        candidates.extend(
+            re.findall(r"[`'\"](/[A-Za-z0-9_./?=&%:+~-]{3,})[`'\"]", prompt)
+        )
+
+    allowed_host = urlparse(base_url).hostname
+    starts: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        absolute = urljoin(base_url, candidate.rstrip(".,;"))
+        if urlparse(absolute).hostname != allowed_host:
+            continue
+        normalized = _normalized_web_url(absolute)
+        if normalized not in seen:
+            seen.add(normalized)
+            starts.append(absolute)
+    return starts[:8]
+
+
+def _same_host_links(body: str, current_url: str, allowed_host: str | None) -> list[str]:
+    soup = BeautifulSoup(body, "html.parser")
+    raw_links = [str(tag.get("href") or "") for tag in soup.find_all("a")]
+    raw_links.extend(re.findall(r"https?://[^\s)\]}>'\"]+", body))
+    links: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_links:
+        if not raw or raw.startswith(("#", "javascript:", "mailto:")):
+            continue
+        absolute = urljoin(current_url, raw)
+        if urlparse(absolute).hostname != allowed_host:
+            continue
+        normalized = _normalized_web_url(absolute)
+        if normalized not in seen:
+            seen.add(normalized)
+            links.append(absolute)
+    return links
+
+
+def _normalized_web_url(value: str) -> str:
+    parsed = urlparse(value)
+    return parsed._replace(fragment="").geturl()
+
+
+def _explicit_web_tokens(body: str, prompt: str) -> set[str]:
+    text = BeautifulSoup(body, "html.parser").get_text(" ", strip=True)
+    candidates: set[str] = set()
+    labeled_patterns = (
+        (
+            r"\b(?:answer|token|flag|secret)\b\s*(?:is|:|=)\s*"
+            r"[`'\"]?([A-Za-z0-9][A-Za-z0-9_.:{}-]{3,159})"
+        ),
+        r"""["'](?:answer|token|flag|secret)["']\s*:\s*
+        ["']([^"'\\\s]{4,160})["']""",
+    )
+    for pattern in labeled_patterns:
+        for match in re.findall(pattern, body + "\n" + text, flags=re.IGNORECASE | re.VERBOSE):
+            value = match.rstrip(".,;:)]'\"")
+            if _looks_like_web_token(value):
+                candidates.add(value)
+
+    prefix_patterns = (
+        (
+            r"(?:starts?|begins?)\s+with(?:\s+the)?(?:\s+prefix)?\s*[`'\"]"
+            r"?([A-Za-z][A-Za-z0-9_-]{1,31})"
+        ),
+        r"\bprefix\s*(?:is|:|=)\s*[`'\"]?([A-Za-z][A-Za-z0-9_-]{1,31})",
+    )
+    prefixes = {
+        match
+        for pattern in prefix_patterns
+        for match in re.findall(pattern, prompt, flags=re.IGNORECASE)
+    }
+    for prefix in prefixes:
+        pattern = rf"(?<![A-Za-z0-9_])({re.escape(prefix)}[A-Za-z0-9_.:{{}}-]{{2,128}})"
+        for match in re.findall(pattern, body):
+            value = match.rstrip(".,;:)]'\"")
+            if _looks_like_web_token(value):
+                candidates.add(value)
+    return candidates
+
+
+def _looks_like_web_token(value: str) -> bool:
+    if not (4 <= len(value) <= 160) or value.lower().startswith(("http", "www.")):
+        return False
+    return any(char.isdigit() for char in value) or any(
+        marker in value for marker in ("-", "_", "{", "}")
+    )
+
+
 def _normalize(value: str) -> str:
     return " ".join(value.lower().split())
 
@@ -1278,7 +1460,10 @@ def _prompt_template(value: str) -> str:
         ),
         (r"(?<![a-z0-9])[a-f0-9]{24,}(?![a-z0-9])", "<hex>"),
         (r"(?<![a-z0-9])[a-z0-9+/]{32,}={0,2}(?![a-z0-9])", "<blob>"),
-        (r"""(["']).*?\1""", "<quoted>"),
+        (
+            r"""(?:"(?:\\.|[^"\\])*"|(?<![a-z0-9])'(?:\\.|[^'\\])*'(?![a-z0-9]))""",
+            "<quoted>",
+        ),
         (
             (
                 r"(?<![a-z0-9_])[-+]?(?:[$€£]\s*)?"

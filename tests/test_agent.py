@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import io
 import json
+import tarfile
 import tempfile
 import time
 import unittest
@@ -135,6 +138,41 @@ class ToolRuntimeTests(unittest.TestCase):
             runtime = TaskToolRuntime(directory, "https://example.test")
             result = runtime.execute("read_file", {"path": "../secret"})
             self.assertIn("path escapes", result)
+
+    def test_extract_archive_supports_gzip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory, "events.jsonl.gz")
+            with gzip.open(archive, "wb") as stream:
+                stream.write(b'{"event":"ok"}\n')
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            result = json.loads(
+                runtime.execute(
+                    "extract_archive",
+                    {"path": archive.name, "output_dir": "unpacked"},
+                )
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["file_count"], 1)
+            self.assertEqual(
+                Path(directory, "unpacked", "events.jsonl").read_text(),
+                '{"event":"ok"}\n',
+            )
+
+    def test_extract_archive_rejects_tar_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory, "unsafe.tar")
+            with tarfile.open(archive, "w") as stream:
+                payload = b"nope"
+                member = tarfile.TarInfo("../escape.txt")
+                member.size = len(payload)
+                stream.addfile(member, io.BytesIO(payload))
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            result = json.loads(
+                runtime.execute("extract_archive", {"path": archive.name})
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn("unsafe", result["error"])
+            self.assertFalse(Path(directory, "escape.txt").exists())
 
     def test_python_subprocess_does_not_receive_team_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -451,10 +489,12 @@ class SolverTests(unittest.TestCase):
             second = SimpleNamespace(
                 type="tool_use",
                 id="tool-2",
-                name="search_artifact",
+                name="record_answer",
                 input={
                     "artifact_id": "artifact-0001",
-                    "pattern": r"TOKEN-[A-Z]+",
+                    "extraction_regex": r"(MISSING-[A-Z]+)",
+                    "confidence": 0.99,
+                    "evidence": "first extraction pattern was too narrow",
                 },
             )
             third = SimpleNamespace(
@@ -488,8 +528,45 @@ class SolverTests(unittest.TestCase):
                 [tool["name"] for tool in game.messages.calls[-1]["tools"]],
                 ["record_answer"],
             )
+            self.assertEqual(len(game.messages.calls[-1]["messages"]), 1)
+            self.assertIn(
+                "recent_artifacts",
+                game.messages.calls[-1]["messages"][0]["content"],
+            )
             self.assertTrue(
                 any("finalizer=1" in message for message in game.logs)
+            )
+
+    def test_finalization_is_skipped_without_a_record_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = FakeSolverGame(directory)
+            game.messages = FakeMessages(
+                [
+                    SimpleNamespace(
+                        content=[
+                            SimpleNamespace(
+                                type="text", text="still investigating"
+                            )
+                        ]
+                    ),
+                    SimpleNamespace(
+                        content=[
+                            SimpleNamespace(type="text", text="no candidate")
+                        ]
+                    ),
+                ]
+            )
+            game.client = SimpleNamespace(messages=game.messages)
+            solver = TileSolver(game, max_turns=2)
+            result = solver.solve(
+                Tile(id="PR-C3", category="Cryptic", points=300),
+                recipe_generation=0,
+            )
+            self.assertIsNone(result)
+            self.assertEqual(len(game.messages.calls), 2)
+            self.assertIn("tools=none", solver.pop_failure_report("PR-C3"))
+            self.assertTrue(
+                any("finalizer=0" in message for message in game.logs)
             )
 
     def test_turn_budget_is_tier_aware(self) -> None:
@@ -717,6 +794,40 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         selected = controller._select_records([sibling, unrelated], room=1)
         self.assertEqual(delay, controller.config.recipe_backoff_seconds)
         self.assertEqual(selected[0].tile.id, unrelated.tile.id)
+
+    async def test_exhaustion_strategy_is_transferred_to_sibling(self) -> None:
+        controller = self._controller_for_unit_tests()
+
+        class Solver:
+            def __init__(self) -> None:
+                self.hints: list[str] = []
+
+            def solve(
+                self,
+                _tile: Tile,
+                _generation: int,
+                _replay=None,
+                _cancellation=None,
+                *,
+                attempt: int = 1,
+                family_failure_hint: str = "",
+            ) -> None:
+                self.hints.append(family_failure_hint)
+
+            @staticmethod
+            def pop_failure_report(task_id: str) -> str:
+                if task_id.endswith("-a"):
+                    return "tools=http_request:8; last_turn_tools=http_request"
+                return ""
+
+        solver = Solver()
+        controller.solver = solver
+        first = TileRecord(Tile("PR-W3-a", "The Dark Web", 300))
+        second = TileRecord(Tile("PR-W3-b", "The Dark Web", 300))
+        await controller._solve(first, CancellationToken())
+        await controller._solve(second, CancellationToken())
+        self.assertEqual(solver.hints[0], "")
+        self.assertIn("http_request:8", solver.hints[1])
 
     async def test_scored_replay_requires_practice_variant_validation(self) -> None:
         controller = self._controller_for_unit_tests()
