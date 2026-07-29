@@ -44,10 +44,13 @@ Besides this README, the agent has these core files:
    throttled submission lane.
 4. **`solver.py` / `tool_runtime.py`** — the bounded Claude tool loop and
    task-scoped filesystem, Python, and stateful HTTP tools.
-5. **`verification.py` / `agent_types.py`** — candidate validation and shared
+5. **`fast_paths.py`** — conservative prompt/file fingerprinting and
+   deterministic solvers for stable data, encoding, document, execution, and
+   compute families.
+6. **`verification.py` / `agent_types.py`** — candidate validation and shared
    state contracts.
-6. **`.env.example`** — connection settings and runtime tuning knobs.
-7. **`requirements.txt`** — extra Python packages your agent needs (see below).
+7. **`.env.example`** — connection settings and runtime tuning knobs.
+8. **`requirements.txt`** — extra Python packages your agent needs (see below).
 
 ## Setup
 
@@ -157,6 +160,13 @@ The model is never given a submit tool. It must use task tools and finish with
 `record_answer`; the controller validates that candidate and resolves
 artifact-backed answers without asking the model to retype exact tokens.
 
+Before constructing the Anthropic client, the solver tries any already
+validated replay recipe and then fingerprints the task title, prompt markers,
+extensions, schemas, archive members, and magic bytes. Stable generated
+families can be solved deterministically; malformed or ambiguous inputs fall
+through to Claude. Set `FAST_PATH_ONLY=1` with `DRY_RUN=1` to calibrate these
+paths while guaranteeing zero model calls.
+
 Model context is compact by construction. `inspect_file` returns table schemas,
 JSON shapes, log counts, and small samples; searches return bounded matches;
 HTTP calls return JSON structure or HTML forms, links, and short text. Full
@@ -164,6 +174,14 @@ stdout and response bodies stay in internal artifacts that can be searched or
 used for exact answer extraction. Per-file read budgets and a universal tool
 response cap prevent whole logs or documents from entering Haiku's context,
 and older tool turns are compacted while preserving tool-call pairing.
+
+Subprocess stdout and stderr are spooled to bounded temporary files before they
+enter memory, and isolated Python runs explicitly include the task workspace so
+extracted packages remain importable. Solver budgets scale from 8 turns on the
+fast tiers to 12 on 500s; no-candidate exhaustion gets one deferred recovery.
+The scheduler reserves half its workers for 400/500 exploration and uses the
+rest for faster tiers. Unreplayed scored 400/500 candidates must also carry a
+separate verification artifact before the submission lane accepts them.
 
 Board polling continues while workers run. If an open tile disappears, the
 controller signals its worker immediately: streamed model responses are closed,

@@ -14,6 +14,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -244,6 +245,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "default": 1,
                 },
                 "answer": {"type": "string", "maxLength": 20000},
+                "verification_artifact_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional artifact from a separate independent check. "
+                        "Required for unreplayed scored 400/500-point answers."
+                    ),
+                },
                 "confidence": {
                     "type": "number",
                     "minimum": 0,
@@ -268,6 +276,7 @@ class RecordedAnswer:
     confidence: float
     evidence: str
     source: str
+    verification_source: str = ""
     replay_recipe: ReplayRecipe | None = None
 
 
@@ -556,37 +565,58 @@ class TaskToolRuntime:
             "PYTHONIOENCODING": "utf-8",
             "TASK_DIR": str(self.root),
         }
-        process = subprocess.Popen(
-            [sys.executable, "-I", "-c", code],
-            cwd=self.root,
-            env=safe_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
+        # Keep the host interpreter isolated while allowing extracted challenge
+        # packages to be imported from this task's workspace.
+        wrapped_code = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(self.root)!r})\n"
+            f"{code}"
         )
-        deadline = time.monotonic() + max(1, min(timeout, 60))
-        timed_out = False
-        while True:
-            if self.cancellation.cancelled:
-                self._kill_process_tree(process)
-                process.communicate()
-                self.cancellation.check()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                self._kill_process_tree(process)
-                stdout, stderr = process.communicate()
-                break
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
+        with (
+            tempfile.TemporaryFile() as stdout_file,
+            tempfile.TemporaryFile() as stderr_file,
+        ):
+            process = subprocess.Popen(
+                [sys.executable, "-I", "-c", wrapped_code],
+                cwd=self.root,
+                env=safe_env,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + max(1, min(timeout, 60))
+            timed_out = False
+            while True:
+                if self.cancellation.cancelled:
+                    self._kill_process_tree(process)
+                    process.wait()
+                    self.cancellation.check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    self._kill_process_tree(process)
+                    process.wait()
+                    break
+                try:
+                    process.wait(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
 
-        self.cancellation.check()
-        stdout_full = stdout[:MAX_ARTIFACT_TEXT]
-        stderr_full = stderr[:MAX_ARTIFACT_TEXT]
+            self.cancellation.check()
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout_bytes = stdout_file.read(MAX_ARTIFACT_TEXT + 1)
+            stderr_bytes = stderr_file.read(MAX_ARTIFACT_TEXT + 1)
+
+        stdout_truncated = len(stdout_bytes) > MAX_ARTIFACT_TEXT
+        stderr_truncated = len(stderr_bytes) > MAX_ARTIFACT_TEXT
+        stdout_full = stdout_bytes[:MAX_ARTIFACT_TEXT].decode(
+            "utf-8", errors="replace"
+        )
+        stderr_full = stderr_bytes[:MAX_ARTIFACT_TEXT].decode(
+            "utf-8", errors="replace"
+        )
         artifact_id = self.artifacts.put(stdout_full)
         stderr_artifact = self.artifacts.put(stderr_full) if stderr_full else None
         self._python_producers[artifact_id] = code
@@ -597,7 +627,8 @@ class TaskToolRuntime:
             "stdout_summary": self._text_summary(stdout_full),
             "stderr_artifact": stderr_artifact,
             "stderr_summary": self._text_summary(stderr_full),
-            "stdout_artifact_truncated": len(stdout) > MAX_ARTIFACT_TEXT,
+            "stdout_artifact_truncated": stdout_truncated,
+            "stderr_artifact_truncated": stderr_truncated,
             "instruction": (
                 "Use search_artifact on stdout_artifact or stderr_artifact "
                 "instead of printing complete output."
@@ -917,6 +948,7 @@ class TaskToolRuntime:
         extraction_regex: str | None = None,
         regex_group: int = 1,
         answer: str | None = None,
+        verification_artifact_id: str | None = None,
     ) -> dict[str, Any]:
         if bool(artifact_id) == bool(answer is not None):
             raise ValueError("provide exactly one of artifact_id or answer")
@@ -940,6 +972,15 @@ class TaskToolRuntime:
             resolved = str(answer)
             source = "model"
 
+        verification_source = ""
+        if verification_artifact_id:
+            if verification_artifact_id == artifact_id:
+                raise ValueError(
+                    "verification_artifact_id must be independent from artifact_id"
+                )
+            self.artifacts.get(verification_artifact_id)
+            verification_source = f"artifact:{verification_artifact_id}"
+
         if not resolved.strip():
             raise ValueError("resolved answer is empty")
         self.recorded_answer = RecordedAnswer(
@@ -947,6 +988,7 @@ class TaskToolRuntime:
             confidence=float(confidence),
             evidence=evidence.strip(),
             source=source,
+            verification_source=verification_source,
             replay_recipe=(
                 ReplayRecipe(
                     code=self._python_producers[artifact_id],
@@ -960,6 +1002,7 @@ class TaskToolRuntime:
         return {
             "recorded": True,
             "source": source,
+            "verification_source": verification_source or None,
             "answer_length": len(self.recorded_answer.answer),
             "answer_preview": self.recorded_answer.answer[:200],
         }

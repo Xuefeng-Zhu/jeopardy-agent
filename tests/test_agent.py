@@ -10,7 +10,14 @@ from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 
-from agent_types import CancellationToken, Candidate, SolveCancelled, Tile
+from agent_types import (
+    CancellationToken,
+    Candidate,
+    SolveCancelled,
+    Tile,
+    TileRecord,
+    TileStatus,
+)
 from orchestrator import (
     AgentConfig,
     AgentController,
@@ -29,6 +36,7 @@ def candidate(
     generation: int = 0,
     answer: str = "TOKEN-ABC",
     source: str = "artifact:artifact-0001",
+    verification_source: str = "artifact:artifact-0002",
     confidence: float = 0.99,
     answer_format: str = "exact",
 ) -> Candidate:
@@ -43,6 +51,7 @@ def candidate(
         confidence=confidence,
         evidence="computed twice and matched",
         source=source,
+        verification_source=verification_source,
     )
 
 
@@ -57,6 +66,19 @@ class VerificationTests(unittest.TestCase):
     def test_rejects_low_confidence_model_retyping(self) -> None:
         result = self.verifier.verify(candidate(source="model", confidence=0.90))
         self.assertFalse(result.accepted)
+
+    def test_scored_high_value_answer_requires_independent_artifact(self) -> None:
+        result = self.verifier.verify(
+            candidate(verification_source="")
+        )
+        self.assertFalse(result.accepted)
+        self.assertIn("separate verification artifact", result.note)
+
+    def test_practice_answer_does_not_require_independent_artifact(self) -> None:
+        result = self.verifier.verify(
+            candidate("PR-A5", verification_source="")
+        )
+        self.assertTrue(result.accepted, result.note)
 
     def test_validates_numeric_and_literal_shapes(self) -> None:
         numeric = candidate(answer="$1,234.50", answer_format="numeric")
@@ -116,6 +138,19 @@ class ToolRuntimeTests(unittest.TestCase):
                 },
             )
             self.assertIn("not-present", result)
+
+    def test_python_subprocess_can_import_workspace_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "challenge_helper.py").write_text(
+                'VALUE = "WORKSPACE-IMPORT-OK"\n',
+                encoding="utf-8",
+            )
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            result = runtime.execute(
+                "run_python",
+                {"code": "import challenge_helper; print(challenge_helper.VALUE)"},
+            )
+            self.assertIn("WORKSPACE-IMPORT-OK", result)
 
     def test_cancellation_kills_running_python_subprocess(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -185,6 +220,52 @@ class ToolRuntimeTests(unittest.TestCase):
                 },
             )
             self.assertEqual(runtime.recorded_answer.answer, "TOKEN-COMPACT-9")
+
+    def test_subprocess_output_is_bounded_before_artifact_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            result = json.loads(
+                runtime.execute(
+                    "run_python",
+                    {"code": 'import sys; sys.stdout.write("X" * 400000)'},
+                )
+            )
+            self.assertTrue(result["stdout_artifact_truncated"])
+            artifact = runtime.artifacts.get(result["stdout_artifact"])
+            self.assertEqual(len(artifact), 250_000)
+
+    def test_verification_artifact_must_be_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            answer_result = json.loads(
+                runtime.execute("run_python", {"code": 'print("TOKEN-OK")'})
+            )
+            answer_artifact = answer_result["stdout_artifact"]
+            rejected = runtime.execute(
+                "record_answer",
+                {
+                    "artifact_id": answer_artifact,
+                    "verification_artifact_id": answer_artifact,
+                    "confidence": 0.99,
+                    "evidence": "same artifact",
+                },
+            )
+            self.assertIn("must be independent", rejected)
+            verification_result = json.loads(
+                runtime.execute("run_python", {"code": 'print("verified")'})
+            )
+            accepted = runtime.execute(
+                "record_answer",
+                {
+                    "artifact_id": answer_artifact,
+                    "verification_artifact_id": verification_result[
+                        "stdout_artifact"
+                    ],
+                    "confidence": 0.99,
+                    "evidence": "independent check",
+                },
+            )
+            self.assertIn('"recorded": true', accepted)
 
     def test_large_file_reads_have_a_compact_total_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -297,6 +378,9 @@ class SolverTests(unittest.TestCase):
             self.assertEqual(result.source, "artifact:artifact-0001")
             self.assertIsNotNone(result.replay_recipe)
             self.assertEqual(len(game.messages.calls), 2)
+            self.assertTrue(
+                any("solver summary outcome=recorded" in line for line in game.logs)
+            )
 
             replayed = solver.solve(
                 Tile(id="PR-C5-b", category="Cryptic", points=500),
@@ -306,6 +390,13 @@ class SolverTests(unittest.TestCase):
             self.assertEqual(replayed.answer, "TOKEN-ABC")
             self.assertTrue(replayed.replayed)
             self.assertEqual(len(game.messages.calls), 2)
+
+    def test_turn_budget_is_tier_aware(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            solver = TileSolver(FakeSolverGame(directory), max_turns=12)
+            self.assertEqual(solver._turn_budget(300), 8)
+            self.assertEqual(solver._turn_budget(400), 10)
+            self.assertEqual(solver._turn_budget(500), 12)
 
     def test_streamed_model_call_closes_when_cancelled(self) -> None:
         class Stream:
@@ -460,6 +551,74 @@ class SubmissionManagerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _controller_for_unit_tests() -> AgentController:
+        class Game:
+            BASE = "https://example.test"
+            MODEL = "test-model"
+
+            def __init__(self) -> None:
+                self.logs: list[str] = []
+
+            def log(self, *values) -> None:
+                self.logs.append(" ".join(map(str, values)))
+
+        return AgentController(Game(), AgentConfig(model_workers=4))
+
+    async def test_scheduler_reserves_workers_for_fast_and_high_tiers(self) -> None:
+        controller = self._controller_for_unit_tests()
+        records = [
+            TileRecord(Tile(f"T-{points}", f"Category-{points}", points))
+            for points in (100, 200, 300, 400, 500)
+        ]
+        controller.records = {record.tile.id: record for record in records}
+        selected = controller._select_records(records, room=4)
+        self.assertEqual(len(selected), 4)
+        self.assertEqual(
+            sum(record.tile.points >= 400 for record in selected),
+            2,
+        )
+        self.assertEqual(
+            sum(record.tile.points < 400 for record in selected),
+            2,
+        )
+
+    async def test_no_candidate_exhaustion_gets_one_deferred_recovery(self) -> None:
+        controller = self._controller_for_unit_tests()
+        record = TileRecord(
+            Tile("PR-C5", "Cryptic", 500),
+            status=TileStatus.SOLVING,
+            attempts=controller.config.max_attempts,
+        )
+        controller._retry_or_fail(
+            record, "solver produced no candidate", recoverable=True
+        )
+        self.assertEqual(record.status, TileStatus.RETRY)
+        self.assertEqual(record.recoveries, 1)
+        self.assertGreater(record.next_attempt_at, time.monotonic())
+
+        record.attempts += 1
+        controller._retry_or_fail(
+            record, "solver produced no candidate", recoverable=True
+        )
+        self.assertEqual(record.status, TileStatus.FAILED)
+
+    async def test_terminal_fast_path_miss_is_not_retried(self) -> None:
+        controller = self._controller_for_unit_tests()
+        record = TileRecord(
+            Tile("PR-H5", "Heavy Compute", 500),
+            status=TileStatus.SOLVING,
+            attempts=1,
+        )
+        controller._retry_or_fail(
+            record,
+            "solver produced no candidate",
+            recoverable=True,
+            terminal=True,
+        )
+        self.assertEqual(record.status, TileStatus.FAILED)
+        self.assertEqual(record.recoveries, 0)
+
     async def test_run_once_dry_run_completes_multiple_tiles(self) -> None:
         class Game:
             BASE = "https://example.test"
@@ -497,6 +656,8 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                 generation: int,
                 _replay=None,
                 _cancellation=None,
+                *,
+                attempt: int = 1,
             ) -> Candidate:
                 return Candidate(
                     task_id=tile.id,
@@ -568,6 +729,8 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                 _generation: int,
                 _replay,
                 cancellation: CancellationToken,
+                *,
+                attempt: int = 1,
             ) -> None:
                 self.started.set()
                 try:

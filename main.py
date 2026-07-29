@@ -30,7 +30,8 @@ async def run() -> None:
         "starting agent: "
         f"workers={config.model_workers} max_turns={config.max_turns} "
         f"max_tiles={config.max_tiles or 'all'} "
-        f"run_once={config.run_once} dry_run={config.dry_run}"
+        f"run_once={config.run_once} dry_run={config.dry_run} "
+        f"fast_paths={config.fast_paths} fast_path_only={config.fast_path_only}"
     )
     controller = AgentController(jp, config)
     await controller.run()

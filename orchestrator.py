@@ -18,6 +18,7 @@ from agent_types import (
     TileRecord,
     TileStatus,
 )
+from fast_paths import is_registered_fast_path_title
 from solver import TileSolver
 from verification import CandidateVerifier
 
@@ -35,15 +36,18 @@ class AgentConfig:
     task_filter: tuple[str, ...] = ()
     max_tiles: int = 0
     model_workers: int = 4
-    max_turns: int = 8
+    max_turns: int = 12
     max_tokens: int = 1800
-    max_attempts: int = 2
+    max_attempts: int = 3
+    recovery_attempts: int = 1
     board_poll_seconds: float = 2.0
     submit_interval: float = 3.15
     minimum_confidence: float = 0.82
     candidate_buffer: int = 16
     run_once: bool = False
     dry_run: bool = False
+    fast_paths: bool = True
+    fast_path_only: bool = False
 
     @classmethod
     def from_env(cls) -> AgentConfig:
@@ -57,9 +61,12 @@ class AgentConfig:
             task_filter=task_filter,
             max_tiles=max(0, int(os.environ.get("MAX_TILES", "0"))),
             model_workers=max(1, int(os.environ.get("MODEL_WORKERS", "4"))),
-            max_turns=max(2, int(os.environ.get("MAX_TURNS", "8"))),
+            max_turns=max(2, int(os.environ.get("MAX_TURNS", "12"))),
             max_tokens=max(256, int(os.environ.get("MAX_MODEL_TOKENS", "1800"))),
-            max_attempts=max(1, int(os.environ.get("MAX_ATTEMPTS", "2"))),
+            max_attempts=max(1, int(os.environ.get("MAX_ATTEMPTS", "3"))),
+            recovery_attempts=max(
+                0, int(os.environ.get("RECOVERY_ATTEMPTS", "1"))
+            ),
             board_poll_seconds=max(
                 0.5, float(os.environ.get("BOARD_POLL_SECONDS", "2"))
             ),
@@ -70,6 +77,8 @@ class AgentConfig:
             candidate_buffer=max(1, int(os.environ.get("CANDIDATE_BUFFER", "16"))),
             run_once=_env_bool("RUN_ONCE"),
             dry_run=_env_bool("DRY_RUN"),
+            fast_paths=_env_bool("FAST_PATHS", default=True),
+            fast_path_only=_env_bool("FAST_PATH_ONLY"),
         )
 
 
@@ -329,6 +338,8 @@ class AgentController:
             max_turns=config.max_turns,
             max_tokens=config.max_tokens,
             verbose=config.verbose,
+            fast_paths=config.fast_paths,
+            fast_path_only=config.fast_path_only,
         )
         self.records: dict[str, TileRecord] = {}
         self.replay_recipes: dict[str, ReplayRecipe] = {}
@@ -442,40 +453,13 @@ class AgentController:
             if record.tile.id in self.open_ids
             and record.status in {TileStatus.NEW, TileStatus.RETRY}
             and record.next_attempt_at <= now
-            and record.attempts < self.config.max_attempts
+            and record.attempts
+            < self.config.max_attempts + record.recoveries
         ]
-        eligible.sort(
-            key=lambda record: (
-                record.tile.points
-                * self.gate.estimated_success(record.tile.recipe_key),
-                record.tile.points,
-            ),
-            reverse=True,
-        )
         room = min(
             capacity, self.config.candidate_buffer - self.submitter.pending_count
         )
-        busy_recipes = {
-            record.tile.recipe_key
-            for record in self.records.values()
-            if record.status in {TileStatus.SOLVING, TileStatus.CANDIDATE}
-        }
-        selected: list[TileRecord] = []
-        selected_recipes: set[str] = set()
-        for record in eligible:
-            recipe_key = record.tile.recipe_key
-            has_replay = recipe_key in self.replay_recipes
-            has_success = self.gate.state(recipe_key).successes > 0
-            if (
-                not has_replay
-                and not has_success
-                and (recipe_key in busy_recipes or recipe_key in selected_recipes)
-            ):
-                continue
-            selected.append(record)
-            selected_recipes.add(recipe_key)
-            if len(selected) >= room:
-                break
+        selected = self._select_records(eligible, room)
 
         for record in selected:
             token = CancellationToken()
@@ -485,6 +469,80 @@ class AgentController:
             task.add_done_callback(
                 lambda _task, task_id=record.tile.id: self._worker_done(task_id)
             )
+
+    def _select_records(
+        self, eligible: list[TileRecord], room: int
+    ) -> list[TileRecord]:
+        """Reserve worker capacity for fast tiers and high-value exploration."""
+
+        if room <= 0:
+            return []
+        ranked = sorted(
+            eligible,
+            key=lambda record: (
+                self._solve_priority(record),
+                record.tile.points,
+                int(is_registered_fast_path_title(record.tile.title)),
+            ),
+            reverse=True,
+        )
+        busy_recipes = {
+            record.tile.recipe_key
+            for record in self.records.values()
+            if record.status in {TileStatus.SOLVING, TileStatus.CANDIDATE}
+        }
+        selected: list[TileRecord] = []
+        selected_recipes: set[str] = set()
+        active_high = sum(
+            1
+            for record in self.records.values()
+            if record.status in {TileStatus.SOLVING, TileStatus.CANDIDATE}
+            and record.tile.points >= 400
+        )
+        high_limit = max(1, self.config.model_workers // 2)
+        high_slots = max(0, min(room, high_limit - active_high))
+
+        def can_select(record: TileRecord) -> bool:
+            recipe_key = record.tile.recipe_key
+            has_replay = recipe_key in self.replay_recipes
+            has_success = self.gate.state(recipe_key).successes > 0
+            return not (
+                not has_replay
+                and not has_success
+                and (recipe_key in busy_recipes or recipe_key in selected_recipes)
+            )
+
+        def take(records: list[TileRecord], limit: int) -> None:
+            for record in records:
+                if len(selected) >= room or limit <= 0:
+                    return
+                if record in selected or not can_select(record):
+                    continue
+                selected.append(record)
+                selected_recipes.add(record.tile.recipe_key)
+                limit -= 1
+
+        high = [record for record in ranked if record.tile.points >= 400]
+        fast = [record for record in ranked if record.tile.points < 400]
+        take(high, high_slots)
+        take(fast, room - len(selected))
+        take(ranked, room - len(selected))
+        return selected
+
+    def _solve_priority(self, record: TileRecord) -> float:
+        expected_seconds = {
+            100: 20.0,
+            200: 30.0,
+            300: 50.0,
+            400: 85.0,
+            500: 140.0,
+        }.get(record.tile.points, 90.0)
+        retry_penalty = 1.0 + (0.25 * record.attempts)
+        return (
+            record.tile.points
+            * self.gate.estimated_success(record.tile.recipe_key)
+            / (expected_seconds * retry_penalty)
+        )
 
     def _worker_done(self, task_id: str) -> None:
         self._active.pop(task_id, None)
@@ -506,6 +564,7 @@ class AgentController:
                 generation,
                 replay_recipe,
                 cancellation,
+                attempt=record.attempts,
             )
             cancellation.check()
         except SolveCancelled as exc:
@@ -525,7 +584,12 @@ class AgentController:
             return
 
         if candidate is None:
-            self._retry_or_fail(record, "solver produced no candidate")
+            self._retry_or_fail(
+                record,
+                "solver produced no candidate",
+                recoverable=not self.config.fast_path_only,
+                terminal=self.config.fast_path_only,
+            )
             return
 
         # A canary can fail while this worker is still reasoning. Do not allow
@@ -558,11 +622,33 @@ class AgentController:
         await self.submitter.enqueue(candidate)
 
     def _retry_or_fail(
-        self, record: TileRecord, reason: str, delay: float | None = None
+        self,
+        record: TileRecord,
+        reason: str,
+        delay: float | None = None,
+        *,
+        recoverable: bool = False,
+        terminal: bool = False,
     ) -> None:
         record.last_error = reason
         record.candidate = None
-        if record.attempts >= self.config.max_attempts:
+        if terminal:
+            record.status = TileStatus.FAILED
+            self.game.log(f"{record.tile.id}: terminal solve outcome: {reason}")
+            return
+        attempt_limit = self.config.max_attempts + record.recoveries
+        if record.attempts >= attempt_limit:
+            if recoverable and record.recoveries < self.config.recovery_attempts:
+                record.recoveries += 1
+                record.status = TileStatus.RETRY
+                record.next_attempt_at = time.monotonic() + max(
+                    60.0, delay or 0.0
+                )
+                self.game.log(
+                    f"{record.tile.id}: deferred for recovery attempt "
+                    f"{record.recoveries}/{self.config.recovery_attempts}: {reason}"
+                )
+                return
             record.status = TileStatus.FAILED
             self.game.log(
                 f"{record.tile.id}: failed after {record.attempts} attempts: {reason}"
@@ -608,6 +694,17 @@ class AgentController:
             return
         if outcome == "incorrect":
             self.replay_recipes.pop(candidate.recipe_key, None)
+            if candidate.strategy.startswith("fast:"):
+                handler = candidate.strategy.removeprefix("fast:")
+                next_generation = self.gate.generation(candidate.recipe_key)
+                self.solver.disable_fast_path(
+                    candidate.recipe_key, next_generation, handler
+                )
+                self.game.log(
+                    f"{candidate.task_id}: disabled fast handler={handler} "
+                    f"for recipe={candidate.recipe_key} "
+                    f"generation={next_generation}"
+                )
             blocked_until = self.gate.state(candidate.recipe_key).blocked_until
             for sibling in self.records.values():
                 if (

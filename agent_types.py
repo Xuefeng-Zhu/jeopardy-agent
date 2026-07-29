@@ -108,6 +108,8 @@ class Candidate:
     confidence: float
     evidence: str
     source: str
+    strategy: str = "claude"
+    verification_source: str = ""
     verified: bool = False
     verification_note: str = ""
     replay_recipe: ReplayRecipe | None = None
@@ -133,6 +135,7 @@ class TileRecord:
     tile: Tile
     status: TileStatus = TileStatus.NEW
     attempts: int = 0
+    recoveries: int = 0
     next_attempt_at: float = 0.0
     last_error: str = ""
     candidate: Candidate | None = None

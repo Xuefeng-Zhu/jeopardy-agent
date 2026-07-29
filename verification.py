@@ -35,6 +35,20 @@ class CandidateVerifier:
             )
         if not candidate.evidence.strip():
             return Verification(False, "candidate has no verification evidence")
+        is_practice = candidate.task_id.startswith("PR-")
+        if (
+            not is_practice
+            and candidate.points >= 400
+            and not candidate.replayed
+            and (
+                not candidate.verification_source
+                or candidate.verification_source == candidate.source
+            )
+        ):
+            return Verification(
+                False,
+                "scored 400/500 answer needs a separate verification artifact",
+            )
 
         fmt = candidate.answer_format or "exact"
         if fmt == "numeric":
