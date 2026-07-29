@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import time
 import unittest
@@ -70,6 +71,11 @@ class VerificationTests(unittest.TestCase):
 
 
 class ToolRuntimeTests(unittest.TestCase):
+    def test_universal_tool_response_cap_handles_escape_heavy_text(self) -> None:
+        result = TaskToolRuntime._result(ok=True, payload="\\" * 20_000)
+        self.assertLessEqual(len(result), 8_000)
+        self.assertTrue(json.loads(result)["compacted"])
+
     def test_artifact_answer_preserves_exact_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = TaskToolRuntime(directory, "https://example.test")
@@ -129,6 +135,86 @@ class ToolRuntimeTests(unittest.TestCase):
                 with self.assertRaises(SolveCancelled):
                     future.result(timeout=2)
                 self.assertLess(time.monotonic() - started, 2)
+
+    def test_inspect_csv_returns_schema_samples_and_aggregates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "events.csv").write_text(
+                "kind,duration,owner\n"
+                "build,12.5,alpha\n"
+                "deploy,7.0,beta\n"
+                "build,9.5,alpha\n",
+                encoding="utf-8",
+            )
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            result_text = runtime.execute("inspect_file", {"path": "events.csv"})
+            result = json.loads(result_text)
+            self.assertLessEqual(len(result_text), 8_000)
+            self.assertEqual(result["row_count"], 3)
+            self.assertEqual(result["column_count"], 3)
+            duration = next(
+                column for column in result["columns"] if column["name"] == "duration"
+            )
+            self.assertEqual(duration["type"], "number")
+            self.assertEqual(duration["min"], 7.0)
+            self.assertEqual(duration["max"], 12.5)
+
+    def test_large_stdout_stays_internal_and_searchable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            result_text = runtime.execute(
+                "run_python",
+                {"code": 'print("X" * 30000); print("TOKEN-COMPACT-9")'},
+            )
+            result = json.loads(result_text)
+            self.assertLessEqual(len(result_text), 8_000)
+            self.assertNotIn("X" * 5_000, result_text)
+            artifact_id = result["stdout_artifact"]
+            search_text = runtime.execute(
+                "search_artifact",
+                {"artifact_id": artifact_id, "pattern": r"TOKEN-[A-Z0-9-]+"},
+            )
+            self.assertLessEqual(len(search_text), 8_000)
+            self.assertIn("TOKEN-COMPACT-9", search_text)
+            runtime.execute(
+                "record_answer",
+                {
+                    "artifact_id": artifact_id,
+                    "extraction_regex": r"(TOKEN-[A-Z0-9-]+)",
+                    "confidence": 0.99,
+                    "evidence": "located in compactly searched stdout",
+                },
+            )
+            self.assertEqual(runtime.recorded_answer.answer, "TOKEN-COMPACT-9")
+
+    def test_large_file_reads_have_a_compact_total_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "large.log").write_text("A" * 20_000, encoding="utf-8")
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            for offset in (0, 4_000, 8_000):
+                result = runtime.execute(
+                    "read_file",
+                    {"path": "large.log", "offset": offset, "limit": 4_000},
+                )
+                self.assertLessEqual(len(result), 8_000)
+            blocked = runtime.execute(
+                "read_file",
+                {"path": "large.log", "offset": 12_000, "limit": 4_000},
+            )
+            self.assertIn("compact read budget exhausted", blocked)
+
+    def test_html_summary_returns_forms_links_and_short_text(self) -> None:
+        body = (
+            "<html><head><title>Login</title></head><body>"
+            '<form method="post" action="/session">'
+            '<input name="csrf" value="abc"><input name="email"></form>'
+            '<a href="/help">Help</a>' + ("long text " * 2_000) + "</body></html>"
+        )
+        summary = TaskToolRuntime._summarize_http_body(body, "text/html")
+        serialized = json.dumps(summary)
+        self.assertEqual(summary["title"], "Login")
+        self.assertEqual(summary["forms"][0]["action"], "/session")
+        self.assertEqual(summary["links"][0]["href"], "/help")
+        self.assertLess(len(serialized), 8_000)
 
 
 class FakeMessages:
@@ -254,6 +340,61 @@ class SolverTests(unittest.TestCase):
             with self.assertRaises(SolveCancelled):
                 future.result(timeout=1)
         self.assertTrue(stream.closed)
+
+    def test_old_tool_turns_are_compacted_but_recent_turn_is_preserved(self) -> None:
+        old_result = "artifact-0007 " + ("R" * 10_000)
+        recent_result = "recent evidence"
+        messages = [
+            {"role": "user", "content": "task"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "old-tool",
+                        "name": "run_python",
+                        "input": {"code": "print(1)\n" + ("x" * 5_000)},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "old-tool",
+                        "content": old_result,
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "recent-tool",
+                        "name": "search_artifact",
+                        "input": {"artifact_id": "artifact-0007", "pattern": "token"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "recent-tool",
+                        "content": recent_result,
+                    }
+                ],
+            },
+        ]
+        TileSolver._compact_history(messages)
+        self.assertLess(len(messages[1]["content"][0]["input"]["code"]), 100)
+        compacted_result = messages[2]["content"][0]["content"]
+        self.assertLess(len(compacted_result), 2_000)
+        self.assertIn("artifact-0007", compacted_result)
+        self.assertEqual(messages[4]["content"][0]["content"], recent_result)
 
 
 class RecipeGateTests(unittest.TestCase):

@@ -157,6 +157,14 @@ The model is never given a submit tool. It must use task tools and finish with
 `record_answer`; the controller validates that candidate and resolves
 artifact-backed answers without asking the model to retype exact tokens.
 
+Model context is compact by construction. `inspect_file` returns table schemas,
+JSON shapes, log counts, and small samples; searches return bounded matches;
+HTTP calls return JSON structure or HTML forms, links, and short text. Full
+stdout and response bodies stay in internal artifacts that can be searched or
+used for exact answer extraction. Per-file read budgets and a universal tool
+response cap prevent whole logs or documents from entering Haiku's context,
+and older tool turns are compacted while preserving tool-call pairing.
+
 Board polling continues while workers run. If an open tile disappears, the
 controller signals its worker immediately: streamed model responses are closed,
 running Python subprocesses are killed, HTTP/file loops stop at their next

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from agent_types import CancellationToken, Candidate, ReplayRecipe, Tile
@@ -44,7 +45,11 @@ BASE_SYSTEM_PROMPT = """You are an autonomous competition task solver.
 Rules:
 - Work from the actual task files and tool results. Never guess.
 - Use tools until you can explain concrete verification evidence.
-- Keep computations reproducible and bounded. Inspect before loading huge files.
+- Keep context compact. Start with list_files and inspect_file. For large data,
+  return schemas, samples, counts, aggregates, and targeted search matches only.
+- Never print or request a complete log, document, table, or HTTP body. Use
+  search_files/search_artifact and short read windows to drill into evidence.
+- Make Python print concise computed summaries and the final candidate, not data.
 - For web tasks, preserve cookies with one named HTTP session.
 - Before finishing, independently check the answer or its defining properties.
 - Finish ONLY by calling record_answer. Do not put the answer in normal prose.
@@ -118,6 +123,7 @@ class TileSolver:
             category,
             "Inspect the materials with tools, compute the result, and verify it.",
         )
+        task_prompt = str(detail.get("prompt") or "")
         prompt = (
             f"Task id: {tile.id}\n"
             f"Category: {category}\n"
@@ -125,7 +131,12 @@ class TileSolver:
             f"Answer format: {answer_format}\n"
             f"Downloaded files: {names or 'none'}\n\n"
             f"Category playbook: {playbook}\n\n"
-            f"Task:\n{str(detail.get('prompt') or '')[:40_000]}"
+            f"Task:\n{task_prompt[:12_000]}"
+            + (
+                "\n[Task instructions truncated at 12,000 characters.]"
+                if len(task_prompt) > 12_000
+                else ""
+            )
         )
         if self.verbose:
             self.game.log(f"{tile.id} solver prompt:\n{prompt}\n---")
@@ -135,6 +146,7 @@ class TileSolver:
 
         for turn in range(1, self.max_turns + 1):
             cancellation.check()
+            self._compact_history(messages)
             request = {
                 "model": self.game.MODEL,
                 "max_tokens": self.max_tokens,
@@ -225,6 +237,49 @@ class TileSolver:
         # Test doubles and older SDKs may expose only create(). Cancellation
         # still applies immediately before and after the blocking request.
         return client.messages.create(**request)
+
+    @staticmethod
+    def _compact_history(messages: list[dict[str, Any]]) -> None:
+        """Bound old turns while retaining valid tool_use/tool_result pairing."""
+
+        if len(messages) <= 4:
+            return
+        for message in messages[1:-2]:
+            content = message.get("content")
+            if isinstance(content, str):
+                if len(content) > 1_200:
+                    message["content"] = content[:1_200] + "\n[older text compacted]"
+                continue
+            if not isinstance(content, list):
+                continue
+            compacted: list[dict[str, Any]] = []
+            for block in content:
+                block = dict(block)
+                block_type = block.get("type")
+                if block_type == "tool_use":
+                    tool_input = dict(block.get("input") or {})
+                    for key in ("code", "content"):
+                        if key in tool_input and len(str(tool_input[key])) > 600:
+                            tool_input[key] = (
+                                f"<older {key} compacted; "
+                                f"{len(str(tool_input[key]))} chars>"
+                            )
+                    block["input"] = tool_input
+                elif block_type == "tool_result":
+                    result = str(block.get("content") or "")
+                    artifact_ids = sorted(set(re.findall(r"artifact-\d+", result)))
+                    block["content"] = json.dumps(
+                        {
+                            "compacted_prior_result": True,
+                            "artifact_ids": artifact_ids,
+                            "sample": result[:1_200],
+                        }
+                    )
+                elif block_type == "text":
+                    text = str(block.get("text") or "")
+                    block["text"] = text[:800]
+                compacted.append(block)
+            message["content"] = compacted
 
     @staticmethod
     def _try_replay(runtime: TaskToolRuntime, recipe: ReplayRecipe):
