@@ -105,6 +105,15 @@ class VerificationTests(unittest.TestCase):
             ).accepted
         )
 
+    def test_rejects_nonfinite_decimal_without_raising(self) -> None:
+        for value in ("NaN", "sNaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                result = self.verifier.verify(
+                    candidate(answer=value, answer_format="numeric")
+                )
+                self.assertFalse(result.accepted)
+                self.assertIn("not finite", result.note)
+
 
 class ToolRuntimeTests(unittest.TestCase):
     def test_universal_tool_response_cap_handles_escape_heavy_text(self) -> None:
@@ -133,11 +142,57 @@ class ToolRuntimeTests(unittest.TestCase):
             self.assertIn('"recorded": true', record_result)
             self.assertEqual(runtime.recorded_answer.answer, "GHOST-6SAS2HPHXQ5V")
 
+    def test_artifact_answer_defaults_to_full_regex_match(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            artifact_id = runtime.artifacts.put("Final token: VAULT-ABC123")
+            result = runtime.execute(
+                "record_answer",
+                {
+                    "artifact_id": artifact_id,
+                    "extraction_regex": r"VAULT-[A-Z0-9]+",
+                    "confidence": 0.99,
+                    "evidence": "matched the explicit final token",
+                },
+            )
+            self.assertIn('"recorded": true', result)
+            self.assertEqual(runtime.recorded_answer.answer, "VAULT-ABC123")
+
     def test_paths_cannot_escape_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime = TaskToolRuntime(directory, "https://example.test")
             result = runtime.execute("read_file", {"path": "../secret"})
             self.assertIn("path escapes", result)
+
+    def test_read_file_seeks_to_bounded_byte_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "large.txt")
+            path.write_bytes((b"x" * 2_000_000) + b"TAIL")
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            result = json.loads(
+                runtime.execute(
+                    "read_file",
+                    {"path": "large.txt", "offset": 2_000_000, "limit": 4},
+                )
+            )
+            self.assertEqual(result["sample"], "TAIL")
+            self.assertEqual(result["returned_bytes"], 4)
+            self.assertFalse(result["truncated"])
+
+    def test_regex_tools_reject_nested_quantifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "text.txt").write_text("a" * 100_000 + "!", encoding="utf-8")
+            runtime = TaskToolRuntime(directory, "https://example.test")
+            started = time.monotonic()
+            result = json.loads(
+                runtime.execute(
+                    "search_files",
+                    {"pattern": r"(a+)+$", "glob": "*.txt"},
+                )
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn("nested quantified", result["error"])
+            self.assertLess(time.monotonic() - started, 0.5)
 
     def test_extract_archive_supports_gzip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -610,6 +665,108 @@ class SolverTests(unittest.TestCase):
                 future.result(timeout=1)
         self.assertTrue(stream.closed)
 
+    def test_cancellation_closes_a_stream_stalled_before_next_event(self) -> None:
+        class Stream:
+            def __init__(self) -> None:
+                self.started = Event()
+                self.released = Event()
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                self.closed = True
+
+            def close(self) -> None:
+                self.closed = True
+                self.released.set()
+
+            def __iter__(self):
+                self.started.set()
+                self.released.wait(10)
+                return
+                yield  # pragma: no cover
+
+            @staticmethod
+            def get_final_message():
+                raise AssertionError("cancelled stream must not complete")
+
+        stream = Stream()
+        client = SimpleNamespace(
+            messages=SimpleNamespace(stream=lambda **_kwargs: stream)
+        )
+        token = CancellationToken()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(TileSolver._model_call, client, {}, token)
+            self.assertTrue(stream.started.wait(timeout=1))
+            token.cancel("claimed elsewhere")
+            with self.assertRaises(SolveCancelled):
+                future.result(timeout=1)
+        self.assertTrue(stream.closed)
+
+    def test_retries_reuse_task_files_runtime_and_model_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = FakeSolverGame(directory)
+            game.task_calls = 0
+            game.fetch_calls = 0
+            game.client_calls = 0
+
+            original_task = game.task
+
+            def counted_task(task_id: str) -> dict:
+                game.task_calls += 1
+                return original_task(task_id)
+
+            def counted_fetch(_task_id: str, _detail: dict) -> list[str]:
+                game.fetch_calls += 1
+                return []
+
+            def counted_client():
+                game.client_calls += 1
+                return game.client
+
+            game.task = counted_task
+            game.fetch_files = counted_fetch
+            game.anthropic_client = counted_client
+            game.messages = FakeMessages(
+                [
+                    SimpleNamespace(content=[SimpleNamespace(type="text", text="x")])
+                    for _ in range(4)
+                ]
+            )
+            game.client = SimpleNamespace(messages=game.messages)
+            solver = TileSolver(game, max_turns=2, fast_paths=False)
+            tile = Tile(id="PR-C3-retry", category="Cryptic", points=300)
+
+            self.assertIsNone(solver.solve(tile, 0, attempt=1))
+            retained = solver._prepared[tile.id].runtime.artifacts.put(
+                "retained evidence"
+            )
+            self.assertIsNone(solver.solve(tile, 0, attempt=2))
+
+            self.assertEqual(game.task_calls, 1)
+            self.assertEqual(game.fetch_calls, 1)
+            self.assertEqual(game.client_calls, 1)
+            self.assertEqual(
+                solver._prepared[tile.id].runtime.artifacts.get(retained),
+                "retained evidence",
+            )
+
+    def test_tool_schemas_are_scoped_to_the_task_category(self) -> None:
+        cryptic = {
+            schema["name"]
+            for schema in TileSolver._tools_for("Cryptic", ["payload.zip"])
+        }
+        web = {
+            schema["name"]
+            for schema in TileSolver._tools_for("The Dark Web", [])
+        }
+        self.assertIn("extract_archive", cryptic)
+        self.assertNotIn("http_request", cryptic)
+        self.assertIn("http_request", web)
+        self.assertNotIn("write_file", web)
+
     def test_old_tool_turns_are_compacted_but_recent_turn_is_preserved(self) -> None:
         old_result = "artifact-0007 " + ("R" * 10_000)
         recent_result = "recent evidence"
@@ -688,6 +845,63 @@ class RecipeGateTests(unittest.TestCase):
 
 
 class SubmissionManagerTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _ordering_manager(
+        *, soft_deadline: float = 15.0
+    ) -> SubmissionManager:
+        async def on_result(_value: Candidate, _result: dict) -> None:
+            return None
+
+        return SubmissionManager(
+            SimpleNamespace(log=lambda *_values: None),
+            AgentConfig(submission_soft_deadline=soft_deadline),
+            RecipeGate(),
+            lambda _task_id: True,
+            on_result,
+        )
+
+    async def test_fresh_candidates_favor_expected_value(self) -> None:
+        manager = self._ordering_manager()
+        now = time.monotonic()
+        low = replace(
+            candidate("Q-A1", recipe="Ancient Scrolls:100"),
+            points=100,
+            created_at=now,
+        )
+        high = replace(
+            candidate("Q-C5", recipe="Cryptic:500"),
+            points=500,
+            created_at=now,
+        )
+        await manager.enqueue(low)
+        await manager.enqueue(high)
+
+        selected = await asyncio.wait_for(manager._next_candidate(), timeout=1)
+
+        self.assertEqual(selected.task_id, "Q-C5")
+        await manager.stop()
+
+    async def test_near_deadline_candidate_preempts_fresh_high_value(self) -> None:
+        manager = self._ordering_manager(soft_deadline=15.0)
+        now = time.monotonic()
+        old_low = replace(
+            candidate("Q-A1", recipe="Ancient Scrolls:100"),
+            points=100,
+            created_at=now - 14.0,
+        )
+        fresh_high = replace(
+            candidate("Q-C5", recipe="Cryptic:500"),
+            points=500,
+            created_at=now,
+        )
+        await manager.enqueue(fresh_high)
+        await manager.enqueue(old_low)
+
+        selected = await asyncio.wait_for(manager._next_candidate(), timeout=1)
+
+        self.assertEqual(selected.task_id, "Q-A1")
+        await manager.stop()
+
     async def test_single_lane_releases_sibling_after_correct_canary(self) -> None:
         class Game:
             def __init__(self) -> None:
@@ -727,6 +941,107 @@ class SubmissionManagerTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(runner, timeout=2)
         self.assertEqual(game.submitted, ["Q-C5-a", "Q-C5-b"])
 
+    async def test_rechecks_open_state_after_rate_limit_wait(self) -> None:
+        submitted: list[str] = []
+        results: list[str] = []
+        open_ids = {"Q-C5-a"}
+
+        class Game:
+            @staticmethod
+            def submit(task_id: str, _answer: str) -> dict:
+                submitted.append(task_id)
+                return {"result": "correct"}
+
+            @staticmethod
+            def log(*_values) -> None:
+                return None
+
+        async def on_result(value: Candidate, result: dict) -> None:
+            results.append(str(result["result"]))
+
+        manager = SubmissionManager(
+            Game(),
+            AgentConfig(submit_interval=0.1),
+            RecipeGate(),
+            lambda task_id: task_id in open_ids,
+            on_result,
+        )
+        manager._last_submit = time.monotonic()
+        runner = asyncio.create_task(manager.run())
+        await manager.enqueue(candidate("Q-C5-a"))
+        await asyncio.sleep(0.02)
+        open_ids.clear()
+        await asyncio.sleep(0.12)
+        await manager.stop()
+        await asyncio.wait_for(runner, timeout=1)
+        self.assertEqual(submitted, [])
+        self.assertEqual(results, ["already_claimed"])
+
+    async def test_auth_failure_terminates_submission_manager(self) -> None:
+        class AuthError(RuntimeError):
+            pass
+
+        class Game:
+            @staticmethod
+            def submit(_task_id: str, _answer: str) -> dict:
+                raise AuthError("bad key")
+
+            @staticmethod
+            def log(*_values) -> None:
+                return None
+
+        async def on_result(_value: Candidate, _result: dict) -> None:
+            raise AssertionError("fatal auth error must not become a result")
+
+        manager = SubmissionManager(
+            Game(),
+            AgentConfig(submit_interval=0),
+            RecipeGate(),
+            lambda _task_id: True,
+            on_result,
+        )
+        await manager.enqueue(candidate("Q-C5-a"))
+        with self.assertRaises(AuthError):
+            await asyncio.wait_for(manager.run(), timeout=1)
+
+    async def test_rechecks_recipe_generation_after_rate_limit_wait(self) -> None:
+        submitted: list[str] = []
+        results: list[str] = []
+        gate = RecipeGate()
+        gate.set_phase("round1")
+        value = candidate("Q-C5-a")
+
+        class Game:
+            @staticmethod
+            def submit(task_id: str, _answer: str) -> dict:
+                submitted.append(task_id)
+                return {"result": "correct"}
+
+            @staticmethod
+            def log(*_values) -> None:
+                return None
+
+        async def on_result(_candidate: Candidate, result: dict) -> None:
+            results.append(str(result["result"]))
+
+        manager = SubmissionManager(
+            Game(),
+            AgentConfig(submit_interval=0.1),
+            gate,
+            lambda _task_id: True,
+            on_result,
+        )
+        manager._last_submit = time.monotonic()
+        runner = asyncio.create_task(manager.run())
+        await manager.enqueue(value)
+        await asyncio.sleep(0.02)
+        gate.on_incorrect(value, 0)
+        await asyncio.sleep(0.12)
+        await manager.stop()
+        await asyncio.wait_for(runner, timeout=1)
+        self.assertEqual(submitted, [])
+        self.assertEqual(results, ["invalidated"])
+
 
 class ControllerTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
@@ -743,22 +1058,170 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
 
         return AgentController(Game(), AgentConfig(model_workers=4))
 
-    async def test_scheduler_reserves_workers_for_fast_and_high_tiers(self) -> None:
+    async def test_scheduler_covers_distinct_categories_in_each_wave(self) -> None:
+        controller = self._controller_for_unit_tests()
+        records = [
+            TileRecord(Tile(f"T-A-{points}", "Category-A", points))
+            for points in (100, 200, 300, 400, 500)
+        ]
+        records.extend(
+            TileRecord(Tile(f"T-{category}", f"Category-{category}", 200))
+            for category in ("B", "C", "D")
+        )
+        controller.records = {record.tile.id: record for record in records}
+        selected = controller._select_records(records, room=4)
+        self.assertEqual(len(selected), 4)
+        self.assertEqual(
+            len({record.tile.category for record in selected}),
+            4,
+        )
+
+    async def test_scheduler_opens_with_distinct_validated_500s(self) -> None:
+        controller = self._controller_for_unit_tests()
+        records = [
+            TileRecord(
+                Tile(
+                    "A5",
+                    "Ancient Scrolls",
+                    500,
+                    "Trust the Errata",
+                    raw={"remaining": 1, "total": 1},
+                )
+            ),
+            TileRecord(
+                Tile(
+                    "C5",
+                    "Cryptic",
+                    500,
+                    "Crib Sheet",
+                    raw={"remaining": 1, "total": 1},
+                )
+            ),
+            TileRecord(
+                Tile(
+                    "H5",
+                    "Heavy Compute",
+                    500,
+                    "Traveling Salesman",
+                    raw={"remaining": 1, "total": 1},
+                )
+            ),
+            TileRecord(
+                Tile(
+                    "N5",
+                    "Needle in the Haystack",
+                    500,
+                    "Thirty Systems",
+                    raw={"remaining": 1, "total": 1},
+                )
+            ),
+            TileRecord(
+                Tile(
+                    "S5",
+                    "Ship It",
+                    500,
+                    "Quintuple Fault",
+                    raw={"remaining": 1, "total": 1},
+                )
+            ),
+            TileRecord(
+                Tile(
+                    "W5",
+                    "The Dark Web",
+                    500,
+                    "Initiation",
+                    raw={"remaining": 1, "total": 1},
+                )
+            ),
+            TileRecord(
+                Tile(
+                    "S2",
+                    "Ship It",
+                    200,
+                    "Spec vs Code",
+                    raw={"remaining": 4, "total": 4},
+                )
+            ),
+            TileRecord(
+                Tile(
+                    "W4",
+                    "The Dark Web",
+                    400,
+                    "The Gatekeeper",
+                    raw={"remaining": 2, "total": 2},
+                )
+            ),
+        ]
+        controller.records = {record.tile.id: record for record in records}
+
+        selected = controller._select_records(records, room=4)
+
+        self.assertEqual(
+            {record.tile.id for record in selected},
+            {"A5", "C5", "H5", "S5"},
+        )
+        self.assertEqual(
+            len({record.tile.category for record in selected}),
+            4,
+        )
+
+    async def test_scheduler_prioritizes_a_contested_cell(self) -> None:
+        controller = self._controller_for_unit_tests()
+        calm = TileRecord(
+            Tile(
+                "T-calm",
+                "Calm",
+                300,
+                raw={"remaining": 8, "total": 8},
+            )
+        )
+        contested = TileRecord(
+            Tile(
+                "T-contested",
+                "Contested",
+                300,
+                raw={"remaining": 1, "total": 8},
+            )
+        )
+        controller.records = {
+            record.tile.id: record for record in (calm, contested)
+        }
+
+        selected = controller._select_records([calm, contested], room=1)
+
+        self.assertEqual(selected[0].tile.id, contested.tile.id)
+
+    async def test_scheduler_covers_unrelated_lane_before_trusted_sibling(
+        self,
+    ) -> None:
+        controller = self._controller_for_unit_tests()
+        first = TileRecord(Tile("T-fast-a", "Fast", 200))
+        sibling = TileRecord(Tile("T-fast-b", "Fast", 200))
+        unrelated = TileRecord(Tile("T-slow", "Slow", 500))
+        controller.gate.state(first.tile.recipe_key).successes = 1
+        records = [first, sibling, unrelated]
+        controller.records = {record.tile.id: record for record in records}
+
+        selected = controller._select_records(records, room=2)
+
+        self.assertEqual(
+            {record.tile.recipe_key for record in selected},
+            {first.tile.recipe_key, unrelated.tile.recipe_key},
+        )
+
+    async def test_scheduler_ranks_tiers_by_expected_yield(self) -> None:
         controller = self._controller_for_unit_tests()
         records = [
             TileRecord(Tile(f"T-{points}", f"Category-{points}", points))
             for points in (100, 200, 300, 400, 500)
         ]
         controller.records = {record.tile.id: record for record in records}
+
         selected = controller._select_records(records, room=4)
-        self.assertEqual(len(selected), 4)
+
         self.assertEqual(
-            sum(record.tile.points >= 400 for record in selected),
-            2,
-        )
-        self.assertEqual(
-            sum(record.tile.points < 400 for record in selected),
-            2,
+            {record.tile.points for record in selected},
+            {100, 200, 300, 400},
         )
 
     async def test_no_candidate_exhaustion_gets_one_deferred_recovery(self) -> None:
@@ -781,6 +1244,43 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(record.status, TileStatus.FAILED)
 
+    async def test_retry_schedule_is_logged(self) -> None:
+        controller = self._controller_for_unit_tests()
+        record = TileRecord(
+            Tile("PR-S3", "Ship It", 300),
+            status=TileStatus.SOLVING,
+            attempts=1,
+        )
+        controller._retry_or_fail(record, "solver produced no candidate", delay=7)
+        self.assertEqual(record.status, TileStatus.RETRY)
+        self.assertTrue(
+            any(
+                "retry scheduled attempt=2 retry_in=7.0s" in message
+                for message in controller.game.logs
+            )
+        )
+
+    async def test_verifier_exception_does_not_leave_tile_solving(self) -> None:
+        controller = self._controller_for_unit_tests()
+        record = TileRecord(Tile("PR-C3", "Cryptic", 300))
+        controller.open_ids.add(record.tile.id)
+
+        class Solver:
+            @staticmethod
+            def solve(*_args, **_kwargs) -> Candidate:
+                return candidate("PR-C3")
+
+        class Verifier:
+            @staticmethod
+            def verify(_candidate: Candidate):
+                raise ArithmeticError("malformed decimal")
+
+        controller.solver = Solver()
+        controller.verifier = Verifier()
+        await controller._solve(record, CancellationToken())
+        self.assertEqual(record.status, TileStatus.RETRY)
+        self.assertIn("verifier error", record.last_error)
+
     async def test_exhausted_recipe_family_is_temporarily_deprioritized(self) -> None:
         controller = self._controller_for_unit_tests()
         exhausted = TileRecord(Tile("PR-S3-a", "Ship It", 300))
@@ -801,6 +1301,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         class Solver:
             def __init__(self) -> None:
                 self.hints: list[str] = []
+                self.prior_hints: list[str] = []
 
             def solve(
                 self,
@@ -811,8 +1312,10 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                 *,
                 attempt: int = 1,
                 family_failure_hint: str = "",
+                prior_failure_hint: str = "",
             ) -> None:
                 self.hints.append(family_failure_hint)
+                self.prior_hints.append(prior_failure_hint)
 
             @staticmethod
             def pop_failure_report(task_id: str) -> str:
@@ -823,11 +1326,15 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         solver = Solver()
         controller.solver = solver
         first = TileRecord(Tile("PR-W3-a", "The Dark Web", 300))
-        second = TileRecord(Tile("PR-W3-b", "The Dark Web", 300))
+        second = TileRecord(
+            Tile("PR-W3-b", "The Dark Web", 300),
+            last_error="previous candidate failed verification",
+        )
         await controller._solve(first, CancellationToken())
         await controller._solve(second, CancellationToken())
         self.assertEqual(solver.hints[0], "")
         self.assertIn("http_request:8", solver.hints[1])
+        self.assertIn("failed verification", solver.prior_hints[1])
 
     async def test_scored_replay_requires_practice_variant_validation(self) -> None:
         controller = self._controller_for_unit_tests()
@@ -896,7 +1403,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.status, TileStatus.FAILED)
         self.assertEqual(record.recoveries, 0)
 
-    async def test_run_once_dry_run_completes_multiple_tiles(self) -> None:
+    async def test_run_once_refills_worker_without_waiting_for_board_poll(self) -> None:
         class Game:
             BASE = "https://example.test"
             MODEL = "test-model"
@@ -953,15 +1460,15 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         controller = AgentController(
             game,
             AgentConfig(
-                model_workers=2,
+                model_workers=1,
                 run_once=True,
                 dry_run=True,
-                board_poll_seconds=0.01,
+                board_poll_seconds=5,
                 submit_interval=0.01,
             ),
         )
         controller.solver = Solver()
-        await asyncio.wait_for(controller.run(), timeout=2)
+        await asyncio.wait_for(controller.run(), timeout=1)
         self.assertEqual(
             {record.status.value for record in controller.records.values()},
             {"solved"},

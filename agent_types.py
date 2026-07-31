@@ -8,6 +8,8 @@ credentials.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from threading import Event, Lock
@@ -35,6 +37,7 @@ class CancellationToken:
         self._event = Event()
         self._lock = Lock()
         self._reason = "cancelled"
+        self._callbacks: list[Callable[[], None]] = []
 
     @property
     def cancelled(self) -> bool:
@@ -46,11 +49,34 @@ class CancellationToken:
             return self._reason
 
     def cancel(self, reason: str) -> None:
+        callbacks: list[Callable[[], None]]
         with self._lock:
             if self._event.is_set():
                 return
             self._reason = reason
             self._event.set()
+            callbacks = self._callbacks
+            self._callbacks = []
+        for callback in callbacks:
+            with suppress(Exception):
+                callback()
+
+    def add_callback(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` when cancelled, including already-cancelled tokens."""
+
+        with self._lock:
+            if not self._event.is_set():
+                self._callbacks.append(callback)
+                return
+        with suppress(Exception):
+            callback()
+
+    def remove_callback(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            try:
+                self._callbacks.remove(callback)
+            except ValueError:
+                pass
 
     def check(self) -> None:
         if self.cancelled:
@@ -189,9 +215,16 @@ class Candidate:
 
     @property
     def priority(self) -> float:
-        # Submission is the scarce resource. Favor value and confidence, with a
-        # small freshness bonus applied by the queue when candidates tie.
+        # Expected tile value remains the baseline submission priority.
         return self.points * max(0.0, min(self.confidence, 1.0))
+
+    def deadline_priority(self, now: float, soft_deadline: float) -> float:
+        """Increase urgency as a queued answer approaches its soft deadline."""
+
+        horizon = max(1.0, soft_deadline)
+        age = max(0.0, now - self.created_at)
+        seconds_remaining = max(1.0, horizon - age)
+        return self.priority / seconds_remaining
 
     def with_verification(self, verified: bool, note: str) -> Candidate:
         return replace(self, verified=verified, verification_note=note)

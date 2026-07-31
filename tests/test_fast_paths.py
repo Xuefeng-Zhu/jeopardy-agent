@@ -4,12 +4,15 @@ import base64
 import hashlib
 import io
 import json
+import math
 import struct
+import tarfile
 import tempfile
 import time
 import unittest
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urljoin
@@ -27,6 +30,7 @@ from agent_types import (
 from fast_paths import (
     FastPathDispatcher,
     FastPathStatus,
+    is_cpu_heavy_fast_path_title,
     is_registered_fast_path_title,
 )
 from orchestrator import AgentConfig, AgentController
@@ -41,6 +45,17 @@ def zip_bytes(files: dict[str, bytes | str]) -> bytes:
             archive.writestr(
                 name, value.encode("utf-8") if isinstance(value, str) else value
             )
+    return output.getvalue()
+
+
+def tar_gz_bytes(files: dict[str, bytes | str]) -> bytes:
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        for name, value in files.items():
+            raw = value.encode("utf-8") if isinstance(value, str) else value
+            info = tarfile.TarInfo(name)
+            info.size = len(raw)
+            archive.addfile(info, io.BytesIO(raw))
     return output.getvalue()
 
 
@@ -153,13 +168,57 @@ class FastPathFixtureTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual({call["session"] for call in calls}, {"fast-breadcrumbs"})
 
+    def test_deep_pages_matches_live_prompt_shape(self) -> None:
+        calls: list[dict] = []
+
+        def fake_execute(runtime, name, arguments):
+            self.assertEqual(name, "http_request")
+            calls.append(arguments)
+            url = str(arguments["url"])
+            if url.endswith("/web/task/start/"):
+                body = '<html><a href="step-2/">next</a></html>'
+            elif url.endswith("/web/task/start/step-2/"):
+                body = "<html>The token is DEEP-ABC123</html>"
+            else:
+                return json.dumps({"ok": False, "error": "unexpected URL"})
+            artifact_id = runtime.artifacts.put(body)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": 200,
+                    "url": url,
+                    "body_artifact": artifact_id,
+                }
+            )
+
+        with patch.object(
+            TaskToolRuntime, "execute", autospec=True, side_effect=fake_execute
+        ):
+            outcome, runtime = self.dispatch(
+                title="Deep Pages",
+                category="The Dark Web",
+                answer_format="exact",
+                prompt=(
+                    "Somewhere deep in this site is a token: "
+                    "https://example.test/web/task/start/ "
+                    "Keep following the 'next' links. Answer with the token "
+                    "(starts with DEEP-)."
+                ),
+                files={},
+            )
+        self.assert_solved(outcome, runtime, "deep_pages", "DEEP-ABC123")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({call["session"] for call in calls}, {"fast-deep_pages"})
+
     def test_bounded_web_trail_rejects_ambiguous_tokens(self) -> None:
         def fake_execute(runtime, _name, arguments):
             body = (
-                "<html>Token: CRUMB-ABC123 "
-                "<a href='/trail/next'>next</a></html>"
+                "<html><a href='/trail/next'>next</a></html>"
                 if str(arguments["url"]).endswith("/start")
-                else "<html>Token: CRUMB-XYZ789</html>"
+                else (
+                    "<html>Token: CRUMB-ABC123 "
+                    "Token: CRUMB-XYZ789</html>"
+                )
             )
             artifact_id = runtime.artifacts.put(body)
             return json.dumps(
@@ -693,6 +752,697 @@ class FastPathFixtureTests(unittest.TestCase):
                         outcome, runtime, str(case["handler"]), str(case["answer"])
                     )
 
+    def test_observed_workfactor_verdict_is_deterministic(self) -> None:
+        prompt = (
+            "Find an ASCII string that begins with 'MINE26D94537-' whose "
+            "SHA-256 digest begins with 68 zero BITS.\n"
+            "If you conclude that no answer exists, or that finding one is "
+            "beyond any feasible amount of compute, do not guess. Answer with "
+            "the word IMPOSSIBLE, a space, and the ONE reason code below that "
+            "applies:\n"
+            "  PARITY     a parity or divisibility argument rules out every candidate\n"
+            "  MAGNITUDE  the target is outside the range any combination can reach\n"
+            "  ONETIMEPAD a one-time pad makes every plaintext equally likely\n"
+            "  WORKFACTOR a solution exists, but the expected work to find it is "
+            "far beyond this event\n"
+            "Exactly one code is correct. A wrong verdict costs the tile's full "
+            "value."
+        )
+        outcome, runtime = self.dispatch(
+            title="Congruential Cascade",
+            category="Heavy Compute",
+            answer_format="validator",
+            prompt=prompt,
+            files={},
+        )
+        self.assert_solved(
+            outcome,
+            runtime,
+            "congruential_workfactor",
+            "IMPOSSIBLE WORKFACTOR",
+        )
+
+    def test_observed_repair_archives_are_solved_from_specs(self) -> None:
+        def digest(value):
+            return hashlib.sha256(repr(value).encode()).hexdigest()[:10]
+
+        def selftest(salt, cases):
+            return (
+                "import hashlib\n"
+                f"SALT = {salt!r}\n"
+                f"CASES = {cases!r}\n"
+                "def _digest(value):\n"
+                "    return hashlib.sha256(repr(value).encode()).hexdigest()[:10]\n"
+                "def main():\n"
+                "    results = []\n"
+                "    for mod_name, fn_name, args, want in CASES:\n"
+                "        got = None\n"
+                "        results.append(got)\n"
+                '    print("MAGIC-" + hashlib.sha256(\n'
+                "        (repr(results) + SALT).encode()).hexdigest()[:12].upper())\n"
+            )
+
+        fix_values = ["alpha", "beta", "10", "9"]
+        fix_cases = [
+            ("core", "top_score", ([("beta", 8), ("alpha", 8)],), digest("alpha")),
+            ("core", "top_score", ([("beta", 9), ("alpha", 8)],), digest("beta")),
+            ("core", "largest_token", (["9", "10"],), digest("10")),
+            ("core", "largest_token", (["8", "9"],), digest("9")),
+        ]
+        fix_salt = "ABCDEFGHIJKLMNOP"
+        fix_expected = (
+            "MAGIC-"
+            + hashlib.sha256(
+                (repr(fix_values) + fix_salt).encode()
+            ).hexdigest()[:12].upper()
+        )
+        fix_core = '''
+"""top_score returns the highest score and the lexicographically smallest
+name on ties. largest_token accepts decimal digit strings and returns the
+largest numeric value."""
+def top_score(pairs):
+    """highest score; lexicographically smallest"""
+def largest_token(tokens):
+    """decimal digit strings; largest numeric value"""
+'''
+        fix_archive = tar_gz_bytes(
+            {
+                "README.md": "repair one function",
+                "proj/__init__.py": "",
+                "proj/core.py": fix_core,
+                "proj/selftest.py": selftest(fix_salt, fix_cases),
+            }
+        )
+        fix, fix_runtime = self.dispatch(
+            title="Fix and Run",
+            category="Ship It",
+            answer_format="exact",
+            prompt=(
+                "Download project.tar.gz and extract it. The package proj/ "
+                "contains exactly ONE function that violates its documented "
+                "spec. Fix it so python proj/selftest.py passes and prints "
+                "MAGIC- followed by 12 uppercase hex characters."
+            ),
+            files={"project.tar.gz": fix_archive},
+        )
+        self.assert_solved(fix, fix_runtime, "fix_and_run", fix_expected)
+
+        observed_core_cases_with_values = [
+            (
+                "core",
+                "running_min",
+                ([5, 3, 4, -1],),
+                [5, 3, 3, -1],
+            ),
+            (
+                "core",
+                "running_min",
+                ([2, 8, 1],),
+                [2, 2, 1],
+            ),
+            (
+                "core",
+                "unique_sorted",
+                ([3, 1, 3, 2],),
+                [1, 2, 3],
+            ),
+            (
+                "core",
+                "unique_sorted",
+                ([7, 7, 4],),
+                [4, 7],
+            ),
+            (
+                "core",
+                "rank_words",
+                (["bbb", "a", "cc", "aa"],),
+                ["a", "aa", "cc", "bbb"],
+            ),
+            (
+                "core",
+                "rank_words",
+                (["z", "b", "aaa"],),
+                ["b", "z", "aaa"],
+            ),
+        ]
+        observed_core_cases = [
+            (module, function, args, digest(value))
+            for module, function, args, value in observed_core_cases_with_values
+        ]
+        observed_core_values = [
+            item[3] for item in observed_core_cases_with_values
+        ]
+        observed_core_salt = "QWERTYUIOPASDFGH"
+        observed_core_expected = (
+            "MAGIC-"
+            + hashlib.sha256(
+                (repr(observed_core_values) + observed_core_salt).encode()
+            ).hexdigest()[:12].upper()
+        )
+        observed_core = '''
+"""running_min returns running minimums with out[i] == min(xs[:i+1]).
+unique_sorted returns distinct values sorted ascending.
+rank_words sorts by length ascending, ties broken alphabetically ascending."""
+def running_min(xs):
+    """running minimums; min(xs[:i+1])"""
+def unique_sorted(xs):
+    """distinct values; sorted ascending"""
+def rank_words(words):
+    """length ascending; alphabetically ascending"""
+'''
+        observed_core_archive = tar_gz_bytes(
+            {
+                "README.md": "repair one function",
+                "proj/__init__.py": "",
+                "proj/core.py": observed_core,
+                "proj/selftest.py": selftest(
+                    observed_core_salt, observed_core_cases
+                ),
+            }
+        )
+        observed, observed_runtime = self.dispatch(
+            title="Fix and Run",
+            category="Ship It",
+            answer_format="exact",
+            prompt=(
+                "Download project.tar.gz and extract it. The package proj/ "
+                "contains exactly ONE function that violates its documented "
+                "spec. Fix it so python proj/selftest.py passes and prints "
+                "MAGIC- followed by 12 uppercase hex characters."
+            ),
+            files={"project.tar.gz": observed_core_archive},
+        )
+        self.assert_solved(
+            observed,
+            observed_runtime,
+            "fix_and_run",
+            observed_core_expected,
+        )
+
+        repair_cases_with_values = [
+            ("alpha", "net_price", (100, 25), 75),
+            ("alpha", "net_price", (99, 10), 90),
+            ("alpha", "col_sums", ([[1, 2], [3, 4]],), [4, 6]),
+            ("alpha", "col_sums", ([[5], [7]],), [12]),
+            ("beta", "chunked", ([1, 2, 3], 2), [[1, 2], [3]]),
+            ("beta", "chunked", ([1, 2], 1), [[1], [2]]),
+            ("beta", "avg_ratio", ([(1, 2), (3, 2)],), 1.0),
+            ("beta", "avg_ratio", ([(2, 1), (4, 1)],), 3.0),
+            ("gamma", "bundle", ("x",), ["x"]),
+            ("gamma", "bundle", ("x", ["a"]), ["a", "x"]),
+            ("gamma", "rank_scores", ([("a", 2), ("b", 2)],), ["a", "b"]),
+            ("gamma", "rank_scores", ([("a", 1), ("b", 2)],), ["b", "a"]),
+            ("delta", "local_day", (86400, 0), 1),
+            ("delta", "local_day", (0, -1), -1),
+        ]
+        repair_cases = [
+            (module, function, args, digest(value))
+            for module, function, args, value in repair_cases_with_values
+        ]
+        repair_values = [item[3] for item in repair_cases_with_values]
+        repair_salt = "PONMLKJIHGFEDCBA"
+        repair_expected = (
+            "MAGIC-"
+            + hashlib.sha256(
+                (repr(repair_values) + repair_salt).encode()
+            ).hexdigest()[:12].upper()
+        )
+        modules = {
+            "proj/alpha.py": '''
+"""net_price uses integer floor arithmetic with discount_pct.
+col_sums returns column sums for a rectangular grid."""
+def net_price(cents, discount_pct):
+    """integer floor arithmetic; discount_pct"""
+def col_sums(grid):
+    """rectangular column sums"""
+''',
+            "proj/beta.py": '''
+"""chunked creates consecutive chunks and the final chunk may be shorter.
+avg_ratio returns the mean of the exact ratios as a float."""
+def chunked(xs, size):
+    """consecutive chunks; final chunk may be shorter"""
+def avg_ratio(pairs):
+    """mean of the exact ratios as a float"""
+''',
+            "proj/gamma.py": '''
+"""bundle returns a new list and must never modify extras.
+rank_scores sorts by score descending and equal scores keep input order."""
+def bundle(item, extras=None):
+    """new list; never modify"""
+def rank_scores(rows):
+    """score descending; equal scores keep their order"""
+''',
+            "proj/delta.py": '''
+"""local_day returns the local calendar day index using 3600 and 86400."""
+def local_day(ts, tz_offset_hours):
+    """local calendar day index; 3600; 86400"""
+''',
+        }
+        fault_archive = tar_gz_bytes(
+            {
+                "README.md": "repair five functions",
+                "proj/__init__.py": "",
+                "proj/selftest.py": selftest(repair_salt, repair_cases),
+                **modules,
+            }
+        )
+        fault, fault_runtime = self.dispatch(
+            title="Quintuple Fault",
+            category="Ship It",
+            answer_format="exact",
+            prompt=(
+                "Download project.tar.gz. Exactly FIVE of the seven functions "
+                "in proj/ alpha.py, beta.py, gamma.py and delta.py violate their "
+                "documented specs. Fix it so python proj/selftest.py passes and "
+                "prints MAGIC- followed by 12 uppercase hex characters."
+            ),
+            files={"project.tar.gz": fault_archive},
+        )
+        self.assert_solved(
+            fault, fault_runtime, "quintuple_fault", repair_expected
+        )
+
+    def test_thirty_systems_handler(self) -> None:
+        rates = {"AA": "1", "BB": "2", "CC": "0.5", "DD": "1.25"}
+        members: dict[str, str] = {
+            "fx.csv": (
+                "region,currency,usd_per_unit\n"
+                + "".join(
+                    f"{region},{region}D,{rate}\n"
+                    for region, rate in rates.items()
+                )
+            )
+        }
+        expected = Decimal(0)
+        for file_index in range(16):
+            region = tuple(rates)[file_index % 4]
+            name = f"sales_{region}_{file_index:03d}.csv"
+            amount = Decimal(file_index + 1)
+            members[name] = (
+                "# generated preamble\n"
+                "amount,txn_id,note\n"
+                f"{amount},txn-{file_index},ok\n"
+                "TOTAL,,footer\n"
+            )
+            expected += amount * Decimal(rates[region])
+        outcome, runtime = self.dispatch(
+            title="Thirty Systems",
+            category="Needle in the Haystack",
+            answer_format="numeric",
+            prompt=(
+                "Use usd_per_unit. Process files in ALPHABETICAL order of "
+                "filename and keep the FIRST occurrence. Return the total "
+                "rounded to 2 decimals."
+            ),
+            files={"regional_sales.zip": zip_bytes(members)},
+        )
+        self.assert_solved(
+            outcome,
+            runtime,
+            "thirty_systems",
+            f"{expected:.2f}",
+        )
+
+    def test_dirty_ledger_parses_the_requested_status(self) -> None:
+        outcome, runtime = self.dispatch(
+            title="Dirty Ledger",
+            category="Needle in the Haystack",
+            answer_format="numeric",
+            prompt=(
+                "Download transactions.csv. The amount column is messy. "
+                "Skip invalid values and compute rows whose status is exactly "
+                "'returned'."
+            ),
+            files={
+                "transactions.csv": (
+                    "txn_id,status,amount\n"
+                    'a,returned,"$1,234.50"\n'
+                    'b,returned,"  2,000.25 USD"\n'
+                    "c,returned,missing\n"
+                    "d,pending,99.00\n"
+                )
+            },
+        )
+        self.assert_solved(
+            outcome,
+            runtime,
+            "dirty_ledger",
+            "3234.75",
+        )
+
+    def test_spec_subset_and_tsp_handlers(self) -> None:
+        spec_outcome, spec_runtime = self.dispatch(
+            title="Spec vs Code",
+            category="Ship It",
+            answer_format="literal",
+            prompt=(
+                "lib.py contains exactly one bug. Per the spec, what should "
+                "bucket_counts([0, 1, 2, 3, 4], [1, 3, 5]) return? "
+                "Answer with the exact Python repr."
+            ),
+            files={
+                "lib.py": "def bucket_counts(values, edges): return []\n",
+                "spec.md": (
+                    "edges is a strictly increasing list. Bucket i covers the "
+                    "half-open range edges[i] <= v < edges[i+1]. Values outside "
+                    "every bucket are ignored."
+                ),
+            },
+        )
+        self.assert_solved(spec_outcome, spec_runtime, "spec_vs_code", "[2, 2]")
+
+        window_outcome, window_runtime = self.dispatch(
+            title="Spec vs Code",
+            category="Ship It",
+            answer_format="literal",
+            prompt=(
+                "Download lib.py and spec.md. lib.py contains exactly one bug. "
+                "Per the spec (NOT per the buggy code), what should "
+                "window_sums([45, 12, 37, 39, -8, 21, 31, 38, 46, 44, 15, 20], "
+                "3) return? Answer with the exact Python repr."
+            ),
+            files={
+                "lib.py": "def window_sums(xs, k): return []\n",
+                "spec.md": (
+                    "Return the sum of every contiguous window of length k, in "
+                    "order. For len(xs) == n the result has exactly n - k + 1 "
+                    "elements."
+                ),
+            },
+        )
+        self.assert_solved(
+            window_outcome,
+            window_runtime,
+            "spec_vs_code",
+            "[94, 88, 68, 52, 44, 90, 115, 128, 105, 79]",
+        )
+
+        values = list(range(1, 49))
+        target_indices = [0, 2, 4, 7, 12, 20]
+        target = sum(values[index] for index in target_indices)
+        subset_outcome, subset_runtime = self.dispatch(
+            title="Needle in 2^44",
+            category="Heavy Compute",
+            answer_format="validator",
+            prompt=(
+                f"Find a subset of EXACTLY {len(target_indices)} numbers whose "
+                f"sum is exactly {target}. It is guaranteed to exist. Answer "
+                "with 0-based indices in strictly ascending order."
+            ),
+            files={
+                "numbers.txt": (
+                    f"TARGET: {target}\nK: {len(target_indices)}\n"
+                    + "\n".join(str(value) for value in values)
+                )
+            },
+        )
+        self.assertEqual(subset_outcome.status, FastPathStatus.SOLVED)
+        self.assertEqual(subset_outcome.handler, "needle_in_2_44")
+        subset = [int(value) for value in subset_outcome.answer.split(",")]
+        self.assertEqual(len(subset), len(target_indices))
+        self.assertEqual(sum(values[index] for index in subset), target)
+        self.assertTrue(subset_outcome.source.startswith("artifact:"))
+        self.assertIsNotNone(subset_runtime)
+
+        points = []
+        for index in range(90):
+            angle = (2 * math.pi * index) / 90
+            points.append(
+                f"{index} {round(1000 * math.cos(angle))} "
+                f"{round(1000 * math.sin(angle))}"
+            )
+        tsp_outcome, _runtime = self.dispatch(
+            title="Traveling Salesman",
+            category="Heavy Compute",
+            answer_format="validator",
+            prompt=(
+                "Find a tour that visits every point exactly once. The total "
+                "Euclidean length must be at most 7000. Answer with a permutation "
+                "and do not repeat the starting index."
+            ),
+            files={"points.txt": "\n".join(points)},
+        )
+        self.assertEqual(tsp_outcome.status, FastPathStatus.SOLVED)
+        self.assertEqual(tsp_outcome.handler, "traveling_salesman")
+        tour = [int(value) for value in tsp_outcome.answer.split(",")]
+        self.assertEqual(sorted(tour), list(range(90)))
+
+    def test_members_only_and_structured_breadcrumbs_handlers(self) -> None:
+        calls: list[dict] = []
+
+        def fake_execute(runtime, name, arguments):
+            self.assertEqual(name, "http_request")
+            calls.append(arguments)
+            url = str(arguments["url"])
+            method = str(arguments.get("method") or "GET")
+            if url.endswith("/members/") and method == "GET":
+                body = (
+                    "<form method='post' action='/login'>"
+                    "<input type='hidden' name='csrf' value='abc'>"
+                    "<input name='user'><input type='password' name='pass'>"
+                    "</form>"
+                )
+                resolved = url
+            elif url.endswith("/login") and method == "POST":
+                self.assertEqual(
+                    arguments["form"],
+                    {
+                        "csrf": "abc",
+                        "user": "alice",
+                        "pass": "secret",
+                    },
+                )
+                body = "<a href='/vault'>Open vault</a>"
+                resolved = "https://example.test/home"
+            elif url.endswith("/vault"):
+                body = "Token: VAULT-ABC123"
+                resolved = url
+            else:
+                return json.dumps({"ok": False, "error": "unexpected URL"})
+            artifact_id = runtime.artifacts.put(body)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": 200,
+                    "url": resolved,
+                    "headers": {},
+                    "body_artifact": artifact_id,
+                }
+            )
+
+        with patch.object(
+            TaskToolRuntime, "execute", autospec=True, side_effect=fake_execute
+        ):
+            outcome, runtime = self.dispatch(
+                title="Members Only",
+                category="The Dark Web",
+                answer_format="exact",
+                prompt=(
+                    "A token sits in the members-only vault at "
+                    "https://example.test/members/ Your credentials — "
+                    "username: alice password: secret. Log in via the form, "
+                    "keep your session cookie, and open the vault. The token "
+                    "starts with VAULT-."
+                ),
+                files={},
+            )
+        self.assert_solved(
+            outcome, runtime, "members_only", "VAULT-ABC123"
+        )
+        self.assertEqual({call["session"] for call in calls}, {"fast-members-only"})
+
+        trail_calls: list[str] = []
+
+        def fake_trail(runtime, _name, arguments):
+            url = str(arguments["url"])
+            trail_calls.append(url)
+            if url.endswith("/start"):
+                body = json.dumps({"next": "/encoded"})
+            elif url.endswith("/encoded"):
+                body = base64.b64encode(b"/finish").decode("ascii")
+            elif url.endswith("/finish"):
+                body = "Token: CRUMB-ABC123"
+            else:
+                return json.dumps({"ok": False, "error": "unexpected URL"})
+            artifact_id = runtime.artifacts.put(body)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": 200,
+                    "url": url,
+                    "headers": {},
+                    "body_artifact": artifact_id,
+                }
+            )
+
+        with patch.object(
+            TaskToolRuntime, "execute", autospec=True, side_effect=fake_trail
+        ):
+            trail, trail_runtime = self.dispatch(
+                title="Breadcrumbs",
+                category="The Dark Web",
+                answer_format="exact",
+                prompt=(
+                    "The trail starts at https://example.test/start. Each step "
+                    "hides a pointer in a different format. The token starts "
+                    "with CRUMB-."
+                ),
+                files={},
+            )
+        self.assert_solved(
+            trail, trail_runtime, "breadcrumbs", "CRUMB-ABC123"
+        )
+        self.assertEqual(len(trail_calls), 3)
+
+    def test_gatekeeper_and_initiation_state_machines(self) -> None:
+        gate_calls: list[dict] = []
+
+        def fake_gate(runtime, _name, arguments):
+            gate_calls.append(arguments)
+            url = str(arguments["url"])
+            if url.endswith("/gate/"):
+                body = (
+                    "First, GET https://example.test/gate/challenge to receive "
+                    "your challenge number N. Then POST a form to "
+                    "https://example.test/gate/answer with a single field "
+                    '"response" equal to (N * N + 42) mod 999983.'
+                )
+            elif url.endswith("/challenge"):
+                body = "Your challenge number: 12"
+            elif url.endswith("/answer"):
+                self.assertEqual(arguments["method"], "POST")
+                self.assertEqual(arguments["form"], {"response": "186"})
+                body = "token: GATE-ABC123"
+            else:
+                return json.dumps({"ok": False, "error": "unexpected URL"})
+            artifact_id = runtime.artifacts.put(body)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": 200,
+                    "url": url,
+                    "headers": {},
+                    "body_artifact": artifact_id,
+                }
+            )
+
+        with patch.object(
+            TaskToolRuntime, "execute", autospec=True, side_effect=fake_gate
+        ):
+            gate, gate_runtime = self.dispatch(
+                title="The Gatekeeper",
+                category="The Dark Web",
+                answer_format="exact",
+                prompt=(
+                    "Get past the gatekeeper at https://example.test/gate/ "
+                    "Read carefully; you must hold a session and answer its "
+                    "challenge. The token starts with GATE-."
+                ),
+                files={},
+            )
+        self.assert_solved(gate, gate_runtime, "gatekeeper", "GATE-ABC123")
+        self.assertEqual(
+            {call["session"] for call in gate_calls}, {"fast-gatekeeper"}
+        )
+
+        initiation_calls: list[dict] = []
+
+        def fake_initiation(runtime, _name, arguments):
+            initiation_calls.append(arguments)
+            url = str(arguments["url"])
+            if url.endswith("/init/"):
+                body = (
+                    "Step 1: POST a form to https://example.test/init/register "
+                    'with field "codename".'
+                )
+            elif url.endswith("/register"):
+                self.assertEqual(
+                    arguments["form"], {"codename": "codexagent"}
+                )
+                body = (
+                    "Your 12-digit verification code is in "
+                    "https://example.test/init/guestbook/red, "
+                    "https://example.test/init/guestbook/green, "
+                    "https://example.test/init/guestbook/blue. "
+                    "Assemble the code in this order: green, blue, red. "
+                    "Then POST it to https://example.test/init/verify as field "
+                    '"code".'
+                )
+            elif "/guestbook/" in url:
+                fragment = {
+                    "red": "3333",
+                    "green": "1111",
+                    "blue": "2222",
+                }[url.rsplit("/", 1)[-1]]
+                body = (
+                    "<ul><li>“9999” — signed, someone</li>"
+                    f"<li>“{fragment}” — signed, codexagent</li></ul>"
+                )
+            elif url.endswith("/verify"):
+                self.assertEqual(arguments["form"], {"code": "111122223333"})
+                body = (
+                    "Verified. Final step: walk the rooms in this exact order: "
+                    "saffron, cedar, iron, obsidian. Visit "
+                    "https://example.test/init/room/&lt;name&gt; for each. "
+                    "Every room request MUST carry the header "
+                    "X-Pilgrim: &lt;your codename&gt;."
+                )
+            elif "/room/" in url:
+                room = url.rsplit("/", 1)[-1]
+                expected = ["saffron", "cedar", "iron", "obsidian"]
+                room_calls = [
+                    call
+                    for call in initiation_calls
+                    if "/room/" in str(call["url"])
+                ]
+                self.assertEqual(room, expected[len(room_calls) - 1])
+                self.assertEqual(
+                    arguments["headers"], {"X-Pilgrim": "codexagent"}
+                )
+                body = (
+                    "token: INIT-ABC123"
+                    if room == "obsidian"
+                    else f"The {room} room accepts you."
+                )
+            else:
+                return json.dumps({"ok": False, "error": "unexpected URL"})
+            artifact_id = runtime.artifacts.put(body)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "status": 200,
+                    "url": url,
+                    "headers": {},
+                    "body_artifact": artifact_id,
+                }
+            )
+
+        with patch.object(
+            TaskToolRuntime, "execute", autospec=True, side_effect=fake_initiation
+        ):
+            initiation, initiation_runtime = self.dispatch(
+                title="Initiation",
+                category="The Dark Web",
+                answer_format="exact",
+                prompt=(
+                    "Complete the initiation at https://example.test/init/ "
+                    "It is a multi-step, stateful ritual. Every rule is stated "
+                    "in the responses; follow ALL of them exactly. The final "
+                    "token starts with INIT-."
+                ),
+                files={},
+            )
+        self.assert_solved(
+            initiation,
+            initiation_runtime,
+            "initiation",
+            "INIT-ABC123",
+        )
+        self.assertEqual(
+            {call["session"] for call in initiation_calls},
+            {"fast-initiation"},
+        )
+
 
 class FastPathSafetyTests(FastPathFixtureTests):
     def test_near_matches_and_malformed_inputs_fall_back(self) -> None:
@@ -739,6 +1489,26 @@ class FastPathSafetyTests(FastPathFixtureTests):
         )
         self.assertEqual(wrong_magic.status, FastPathStatus.INCONCLUSIVE)
         self.assertFalse(wrong_magic.answer)
+
+        feasible_pow, _ = self.dispatch(
+            title="Congruential Cascade",
+            category="Heavy Compute",
+            answer_format="validator",
+            prompt=(
+                "Find an ASCII string that begins with 'TEST-' whose SHA-256 "
+                "digest begins with 32 zero BITS. If it is beyond compute, "
+                "answer IMPOSSIBLE with one code:\n"
+                "PARITY parity rules out every candidate\n"
+                "MAGNITUDE target is outside the range\n"
+                "ONETIMEPAD a one-time pad makes plaintext equally likely\n"
+                "WORKFACTOR a solution exists, but the expected work is far "
+                "beyond this event\n"
+                "A wrong verdict is penalized."
+            ),
+            files={},
+        )
+        self.assertEqual(feasible_pow.status, FastPathStatus.INCONCLUSIVE)
+        self.assertFalse(feasible_pow.answer)
 
     def test_ambiguous_values_and_malformed_jsonl_are_inconclusive(self) -> None:
         records = [
@@ -1108,6 +1878,40 @@ class FastPathIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected[0].tile.id, "T-2")
         self.assertTrue(is_registered_fast_path_title("Dirty Ledger"))
         self.assertFalse(is_registered_fast_path_title("Ordinary"))
+
+    def test_scheduler_caps_cpu_heavy_fast_paths(self) -> None:
+        class Game:
+            BASE = "https://example.test"
+            MODEL = "unused"
+
+            @staticmethod
+            def log(*_values) -> None:
+                return None
+
+        controller = AgentController(
+            Game(),
+            AgentConfig(model_workers=4, cpu_heavy_workers=1),
+        )
+        records = [
+            TileRecord(
+                Tile("H3", "Heavy Compute", 300, "Proof of Work")
+            ),
+            TileRecord(
+                Tile("H4", "Heavy Compute", 400, "Needle in 2^44")
+            ),
+            TileRecord(
+                Tile("N1", "Needle in the Haystack", 100, "Dirty Ledger")
+            ),
+            TileRecord(Tile("O1", "Other", 200, "Ordinary")),
+        ]
+        selected = controller._select_records(records, 4)
+        heavy = [
+            record
+            for record in selected
+            if is_cpu_heavy_fast_path_title(record.tile.title)
+        ]
+        self.assertEqual(len(heavy), 1)
+        self.assertIn("N1", {record.tile.id for record in selected})
 
     def test_generator_fingerprint_ignores_instance_values(self) -> None:
         first, _ = FastPathFixtureTests.dispatch(

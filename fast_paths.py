@@ -8,12 +8,15 @@ inconclusive: callers must fall back to the model rather than guess.
 
 from __future__ import annotations
 
+import ast
 import base64
 import binascii
+import bisect
 import calendar
 import csv
 import hashlib
 import io
+import itertools
 import json
 import math
 import os
@@ -22,22 +25,24 @@ import signal
 import struct
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import zlib
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Protocol
 from urllib.parse import urljoin, urlparse
 from zipfile import BadZipFile, ZipFile
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 
 from agent_types import CancellationToken, SolveCancelled, Tile
-from tool_runtime import TaskToolRuntime
+from tool_runtime import TaskToolRuntime, python_resource_prelude
 
 MAX_FINGERPRINT_FILES = 160
 MAX_ARCHIVE_MEMBERS = 256
@@ -133,7 +138,11 @@ class TaskFingerprint:
                 try:
                     path = _safe_task_path(root, name)
                     size = path.stat().st_size if path.is_file() else 0
-                    magic = path.read_bytes()[:16].hex() if path.is_file() else ""
+                    if path.is_file():
+                        with path.open("rb") as stream:
+                            magic = stream.read(16).hex()
+                    else:
+                        magic = ""
                 except (OSError, ValueError):
                     size = 0
                     magic = ""
@@ -339,20 +348,32 @@ class DirtyLedgerHandler(BaseHandler):
     title = "Dirty Ledger"
     category = "Needle in the Haystack"
     answer_formats = ("numeric",)
-    prompt_phrases = ("amount column is messy", "status is exactly", "pending")
+    prompt_phrases = ("amount column is messy", "status is exactly")
 
     def solve(self, context: FastPathContext) -> tuple[str, str, float]:
         _require_files(context.fingerprint, {"transactions.csv"})
         file = _require_file(context.fingerprint, "transactions.csv")
         _require_columns(file, {"txn_id", "status", "amount"})
+        status_match = re.search(
+            r"status is exactly\s*[\"']([A-Za-z0-9_-]+)[\"']",
+            context.fingerprint.prompt,
+            re.IGNORECASE,
+        )
+        if not status_match:
+            raise FastPathError("target ledger status is missing")
+        target_status = status_match.group(1)
         path = context.path("transactions.csv")
-        total_decimal, valid_rows = _dirty_ledger_decimal(path, context)
-        total_cents, valid_rows_again = _dirty_ledger_cents(path, context)
+        total_decimal, valid_rows = _dirty_ledger_decimal(
+            path, target_status, context
+        )
+        total_cents, valid_rows_again = _dirty_ledger_cents(
+            path, target_status, context
+        )
         if valid_rows != valid_rows_again or total_decimal != Decimal(total_cents) / 100:
             raise FastPathError("independent money totals disagree")
         answer = _format_decimal(total_decimal.quantize(Decimal("0.01")), places=2)
         evidence = (
-            f"parsed exact pending rows twice with Decimal and integer cents; "
+            f"parsed exact {target_status!r} rows twice with Decimal and integer cents; "
             f"valid_rows={valid_rows} totals matched"
         )
         return answer, evidence, 0.995
@@ -550,6 +571,60 @@ class SessionHunterHandler(BaseHandler):
             user,
             f"parsed {rows} unsorted log rows; rebuilt sessions for {len(events)} users; rank={rank} count={count}",
             0.99,
+        )
+
+
+class ThirtySystemsHandler(BaseHandler):
+    name = "thirty_systems"
+    title = "Thirty Systems"
+    category = "Needle in the Haystack"
+    answer_formats = ("numeric",)
+    prompt_phrases = (
+        "alphabetical order of filename",
+        "first occurrence",
+        "usd_per_unit",
+        "round",
+        "2 decimals",
+    )
+    timeout_seconds = 20.0
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, {"regional_sales.zip"})
+        archive_file = _require_file(
+            context.fingerprint, "regional_sales.zip"
+        )
+        if archive_file.kind != "zip":
+            raise FastPathError("regional_sales.zip is not a ZIP archive")
+        with ZipFile(context.path("regional_sales.zip")) as archive:
+            infos = _validate_archive(archive, context)
+            names = {item.filename for item in infos if not item.is_dir()}
+            expected_sales = sorted(
+                name
+                for name in names
+                if re.fullmatch(r"sales_[A-Z]{2}_\d{3}\.csv", name)
+            )
+            if "fx.csv" not in names or len(expected_sales) != 16:
+                raise FastPathError("regional archive manifest is unexpected")
+            rates = _regional_fx_rates(archive.read("fx.csv"))
+            total, kept = _regional_sales_total(
+                archive, expected_sales, rates, context
+            )
+        mirror = sum(
+            (amount * rates[region] for _txn, region, amount in kept),
+            Decimal(0),
+        )
+        if mirror != total or len({txn for txn, _region, _amount in kept}) != len(
+            kept
+        ):
+            raise FastPathError("regional revenue verification disagreed")
+        rounded = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return (
+            _format_decimal(rounded, places=2),
+            (
+                f"validated 16 exports; retained {len(kept)} globally unique "
+                "transactions; exact Decimal USD total recomputed before rounding"
+            ),
+            0.999,
         )
 
 
@@ -1017,6 +1092,127 @@ class SpaghettiHandler(BaseHandler):
         return output, "sanitized subprocess exited zero twice with one identical OUT line", 0.997
 
 
+class SpecVsCodeHandler(BaseHandler):
+    name = "spec_vs_code"
+    title = "Spec vs Code"
+    category = "Ship It"
+    answer_formats = ("literal",)
+    prompt_phrases = (
+        "lib.py contains exactly one bug",
+        "per the spec",
+        "exact python repr",
+    )
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, {"lib.py", "spec.md"})
+        spec = context.text("spec.md")
+        normalized_spec = _normalize(spec)
+        prompt = context.fingerprint.prompt
+        bucket_match = re.search(
+            r"bucket_counts\(\s*(\[[^\]]*\])\s*,\s*(\[[^\]]*\])\s*\)",
+            prompt,
+        )
+        window_match = re.search(
+            r"window_sums\(\s*(\[[^\]]*\])\s*,\s*(\d+)\s*\)",
+            prompt,
+        )
+        if bucket_match:
+            if not all(
+                marker in normalized_spec
+                for marker in (
+                    "strictly increasing",
+                    "half-open range",
+                    "values outside every bucket are ignored",
+                )
+            ):
+                raise FastPathError("bucket specification is not the known family")
+            try:
+                values = ast.literal_eval(bucket_match.group(1))
+                edges = ast.literal_eval(bucket_match.group(2))
+            except (SyntaxError, ValueError) as exc:
+                raise FastPathError("bucket_counts invocation is malformed") from exc
+            if (
+                not isinstance(values, list)
+                or not isinstance(edges, list)
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in values
+                )
+                or any(
+                    isinstance(edge, bool) or not isinstance(edge, int)
+                    for edge in edges
+                )
+                or len(edges) < 2
+                or any(left >= right for left, right in itertools.pairwise(edges))
+            ):
+                raise FastPathError("bucket invocation violates the specification")
+            counts = [0] * (len(edges) - 1)
+            for value in values:
+                index = bisect.bisect_right(edges, value) - 1
+                if 0 <= index < len(counts) and value < edges[index + 1]:
+                    counts[index] += 1
+            mirror = [
+                sum(1 for value in values if low <= value < high)
+                for low, high in itertools.pairwise(edges)
+            ]
+            if counts != mirror:
+                raise FastPathError("independent bucket computations disagree")
+            return (
+                repr(counts),
+                (
+                    f"parsed the invocation from the prompt; applied {len(counts)} "
+                    "half-open ranges with binary search and direct recount"
+                ),
+                0.999,
+            )
+        if window_match:
+            if not all(
+                marker in normalized_spec
+                for marker in (
+                    "contiguous window of length k",
+                    "in order",
+                    "n - k + 1 elements",
+                )
+            ):
+                raise FastPathError("window specification is not the known family")
+            try:
+                values = ast.literal_eval(window_match.group(1))
+                width = int(window_match.group(2))
+            except (SyntaxError, ValueError) as exc:
+                raise FastPathError("window_sums invocation is malformed") from exc
+            if (
+                not isinstance(values, list)
+                or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in values
+                )
+                or not 1 <= width <= len(values)
+            ):
+                raise FastPathError("window invocation violates the specification")
+            sums = [
+                sum(values[index : index + width])
+                for index in range(len(values) - width + 1)
+            ]
+            prefix = [0]
+            for value in values:
+                prefix.append(prefix[-1] + value)
+            mirror = [
+                prefix[index + width] - prefix[index]
+                for index in range(len(values) - width + 1)
+            ]
+            if sums != mirror or len(sums) != len(values) - width + 1:
+                raise FastPathError("independent window computations disagree")
+            return (
+                repr(sums),
+                (
+                    f"parsed the invocation from the prompt; computed all "
+                    f"{len(sums)} windows by slicing and prefix-sum recount"
+                ),
+                0.999,
+            )
+        raise FastPathError("prompt does not contain a supported spec invocation")
+
+
 class TinyVMHandler(BaseHandler):
     name = "tiny_vm"
     title = "Tiny VM"
@@ -1035,6 +1231,78 @@ class TinyVMHandler(BaseHandler):
         if not re.fullmatch(r"VM-[A-Za-z0-9_-]+", output):
             raise FastPathError("VM output is not one format-valid line")
         return output, "sanitized VM subprocess exited zero twice with one identical VM line", 0.997
+
+
+class FixAndRunHandler(BaseHandler):
+    name = "fix_and_run"
+    title = "Fix and Run"
+    category = "Ship It"
+    answer_formats = ("exact",)
+    prompt_phrases = (
+        "project.tar.gz",
+        "exactly one function",
+        "violates its documented spec",
+        "python proj/selftest.py",
+        "magic-",
+    )
+    timeout_seconds = 8.0
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        expected = {
+            "README.md",
+            "proj/__init__.py",
+            "proj/core.py",
+            "proj/selftest.py",
+        }
+        answer, cases = _solve_repair_archive(context, expected, {"core"})
+        return (
+            answer,
+            (
+                f"parsed {cases} literal self-test cases from a bounded tarball; "
+                "recomputed every expected digest from the documented contracts"
+            ),
+            0.999,
+        )
+
+
+class QuintupleFaultHandler(BaseHandler):
+    name = "quintuple_fault"
+    title = "Quintuple Fault"
+    category = "Ship It"
+    answer_formats = ("exact",)
+    prompt_phrases = (
+        "project.tar.gz",
+        "exactly five of the seven functions",
+        "alpha.py",
+        "beta.py",
+        "gamma.py",
+        "delta.py",
+        "python proj/selftest.py",
+        "magic-",
+    )
+    timeout_seconds = 8.0
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        expected = {
+            "README.md",
+            "proj/__init__.py",
+            "proj/alpha.py",
+            "proj/beta.py",
+            "proj/gamma.py",
+            "proj/delta.py",
+            "proj/selftest.py",
+        }
+        answer, cases = _solve_repair_archive(
+            context, expected, {"alpha", "beta", "gamma", "delta"}
+        )
+        return (
+            answer,
+            (
+                f"parsed {cases} literal self-test cases from a bounded tarball; "
+                "recomputed every expected digest from seven documented contracts"
+            ),
+            0.999,
+        )
 
 
 class CongruentialCascadeHandler(BaseHandler):
@@ -1064,15 +1332,79 @@ class CongruentialCascadeHandler(BaseHandler):
         divisor_value = int(divisor.group(1))
         if count < 1 or modulus < 2 or divisor_value < 1:
             raise FastPathError("recurrence parameters are outside safe bounds")
-        first = _lcg_sum(
+        result = _lcg_sum(
             x0, multiplier, increment, modulus, count, divisor_value, context
         )
-        second = _lcg_sum(
-            x0, multiplier, increment, modulus, count, divisor_value, context
+        expected_final = _lcg_final_state(
+            x0, multiplier, increment, modulus, count
         )
-        if first != second:
-            raise FastPathError("independent recurrence computations disagree")
-        return str(first[0]), f"generated {count} terms twice; sum/count/final-state all matched", 0.999
+        if result[2] != expected_final:
+            raise FastPathError("linear and logarithmic final-state checks disagree")
+        return (
+            str(result[0]),
+            f"generated {count} terms once; logarithmic final-state check matched",
+            0.999,
+        )
+
+
+class CongruentialWorkfactorHandler(BaseHandler):
+    name = "congruential_workfactor"
+    title = "Congruential Cascade"
+    category = "Heavy Compute"
+    answer_formats = ("validator",)
+    prompt_phrases = (
+        "sha-256 digest",
+        "zero bits",
+        "impossible",
+        "workfactor",
+        "expected work",
+        "far beyond this event",
+        "wrong verdict",
+    )
+    timeout_seconds = 1.0
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, set())
+        prompt = context.fingerprint.prompt
+        target = re.search(
+            r"sha-256 digest begins with (\d+) zero bits", prompt, re.IGNORECASE
+        )
+        prefix = re.search(
+            r"ascii string that begins with '([^']+)'", prompt, re.IGNORECASE
+        )
+        rubric = re.findall(
+            r"^\s*([A-Z]+)\s+(.+)$", prompt, re.MULTILINE
+        )
+        reasons = {code: text for code, text in rubric}
+        if (
+            not target
+            or not prefix
+            or set(reasons) != {"PARITY", "MAGNITUDE", "ONETIMEPAD", "WORKFACTOR"}
+            or "solution exists" not in reasons["WORKFACTOR"].lower()
+            or "expected work" not in reasons["WORKFACTOR"].lower()
+        ):
+            raise FastPathError("impossibility rubric is not the observed validator")
+        zero_bits = int(target.group(1))
+        fixed_prefix = prefix.group(1)
+        if (
+            zero_bits < 60
+            or zero_bits > 256
+            or not fixed_prefix
+            or any(ord(char) < 33 or ord(char) > 126 for char in fixed_prefix)
+        ):
+            raise FastPathError("proof-of-work parameters are outside safe verdict bounds")
+        expected_trials = 1 << zero_bits
+        if expected_trials < 1 << 60:
+            raise FastPathError("proof-of-work is not demonstrably event-infeasible")
+        return (
+            "IMPOSSIBLE WORKFACTOR",
+            (
+                f"validator explicitly maps feasible-but-event-intractable search "
+                f"to WORKFACTOR; a {zero_bits}-bit SHA-256 prefix requires "
+                f"2^{zero_bits} expected trials"
+            ),
+            0.999,
+        )
 
 
 class SquarefreeCensusHandler(BaseHandler):
@@ -1098,11 +1430,12 @@ class SquarefreeCensusHandler(BaseHandler):
         divisor = int(divisor_match.group(1))
         if high - low + 1 != expected or low < 1 or divisor < 1:
             raise FastPathError("squarefree range invariants failed")
-        first = _squarefree_count(low, high, divisor, context)
-        second = _squarefree_count(low, high, divisor, context)
-        if first != second:
-            raise FastPathError("independent squarefree counts disagree")
-        return str(first), f"segmented squarefree sieve over {expected} integers ran twice and matched", 0.999
+        result = _squarefree_count(low, high, divisor, context)
+        return (
+            str(result),
+            f"segmented squarefree sieve over {expected} integers with trial-division spot checks",
+            0.999,
+        )
 
 
 class ProofOfWorkHandler(BaseHandler):
@@ -1146,6 +1479,502 @@ class ProofOfWorkHandler(BaseHandler):
         raise FastPathError("proof-of-work nonce search bound exhausted")
 
 
+class NeedleInTwoTo44Handler(BaseHandler):
+    name = "needle_in_2_44"
+    title = "Needle in 2^44"
+    category = "Heavy Compute"
+    answer_formats = ("validator",)
+    prompt_phrases = (
+        "subset of exactly",
+        "0-based indices",
+        "strictly ascending order",
+        "guaranteed to exist",
+    )
+    timeout_seconds = 55.0
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, {"numbers.txt"})
+        lines = [
+            line.strip()
+            for line in context.text("numbers.txt", max_bytes=100_000).splitlines()
+            if line.strip()
+        ]
+        if len(lines) != 50:
+            raise FastPathError("numbers.txt does not contain 48 values")
+        target_match = re.fullmatch(r"TARGET:\s*(\d+)", lines[0])
+        size_match = re.fullmatch(r"K:\s*(\d+)", lines[1])
+        if not target_match or not size_match:
+            raise FastPathError("subset target header is malformed")
+        target = int(target_match.group(1))
+        subset_size = int(size_match.group(1))
+        values = [int(value) for value in lines[2:]]
+        if (
+            target <= 0
+            or not 1 <= subset_size <= len(values)
+            or any(value <= 0 for value in values)
+            or len(set(values)) != len(values)
+        ):
+            raise FastPathError("subset instance invariants failed")
+        prompt_numbers = re.search(
+            r"subset of EXACTLY (\d+).*?sum is exactly (\d+)",
+            context.fingerprint.prompt,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if prompt_numbers and (
+            int(prompt_numbers.group(1)) != subset_size
+            or int(prompt_numbers.group(2)) != target
+        ):
+            raise FastPathError("prompt and subset file disagree")
+        indices = _fixed_cardinality_subset_sum(
+            values, target, subset_size, context
+        )
+        if (
+            len(indices) != subset_size
+            or indices != sorted(set(indices))
+            or sum(values[index] for index in indices) != target
+        ):
+            raise FastPathError("subset solution verification failed")
+        return (
+            ",".join(str(index) for index in indices),
+            (
+                f"cardinality-aware meet-in-the-middle found {subset_size} "
+                "strictly increasing indices; exact sum independently recomputed"
+            ),
+            0.999,
+        )
+
+
+class TravelingSalesmanHandler(BaseHandler):
+    name = "traveling_salesman"
+    title = "Traveling Salesman"
+    category = "Heavy Compute"
+    answer_formats = ("validator",)
+    prompt_phrases = (
+        "visits every point exactly once",
+        "total euclidean length",
+        "permutation",
+        "do not repeat",
+    )
+    timeout_seconds = 50.0
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, {"points.txt"})
+        threshold_match = re.search(
+            r"must be at most\s+(\d+)", context.fingerprint.prompt, re.IGNORECASE
+        )
+        if not threshold_match:
+            raise FastPathError("tour threshold is missing")
+        threshold = float(threshold_match.group(1))
+        points: dict[int, tuple[float, float]] = {}
+        for line_number, line in enumerate(context.text("points.txt").splitlines(), 1):
+            parts = line.split()
+            if len(parts) != 3:
+                raise FastPathError(f"malformed point line {line_number}")
+            index = int(parts[0])
+            if index in points:
+                raise FastPathError("duplicate point index")
+            points[index] = (float(parts[1]), float(parts[2]))
+        if sorted(points) != list(range(90)):
+            raise FastPathError("points.txt must contain indices 0..89")
+        order = sorted(points)
+        distances = [
+            [
+                math.hypot(
+                    points[left][0] - points[right][0],
+                    points[left][1] - points[right][1],
+                )
+                for right in order
+            ]
+            for left in order
+        ]
+        tour, length = _tsp_search(distances, threshold, context)
+        if sorted(tour) != order or len(tour) != len(order):
+            raise FastPathError("tour is not a permutation")
+        verified = _tour_length(tour, distances)
+        if not math.isclose(length, verified, rel_tol=1e-12, abs_tol=1e-6):
+            raise FastPathError("tour length verification disagreed")
+        if verified > threshold + 1e-7:
+            raise FastPathError("best deterministic tour exceeds threshold")
+        return (
+            ",".join(str(index) for index in tour),
+            (
+                f"multi-start nearest-neighbor and iterated 2-opt produced a "
+                f"90-point closed tour of length {verified:.6f} <= {threshold:.6f}"
+            ),
+            0.998,
+        )
+
+
+class GatekeeperHandler(BaseHandler):
+    name = "gatekeeper"
+    title = "The Gatekeeper"
+    category = "The Dark Web"
+    answer_formats = ("exact",)
+    prompt_phrases = (
+        "get past the gatekeeper",
+        "hold a session",
+        "answer its challenge",
+        "starts with gate-",
+    )
+    timeout_seconds = 18.0
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, set())
+        starts = _web_trail_starts(
+            context.fingerprint.prompt, context.runtime.base_url
+        )
+        if len(starts) != 1:
+            raise FastPathError("gatekeeper start URL is ambiguous")
+        session = "fast-gatekeeper"
+        instructions = _fast_http_page(context, starts[0], session=session)
+        text = BeautifulSoup(
+            instructions["body"], "html.parser"
+        ).get_text(" ", strip=True)
+        challenge_url = _one_same_host_url(
+            text, context.runtime.allowed_host, suffix="/challenge"
+        )
+        answer_url = _one_same_host_url(
+            text, context.runtime.allowed_host, suffix="/answer"
+        )
+        rule = re.search(
+            r"field [\"']([^\"']+)[\"'] equal to "
+            r"\(N \* N \+ (\d+)\) mod (\d+)",
+            text,
+            re.IGNORECASE,
+        )
+        if not rule:
+            raise FastPathError("gatekeeper arithmetic rule is missing")
+        field, increment_text, modulus_text = rule.groups()
+        challenge = _fast_http_page(context, challenge_url, session=session)
+        numbers = re.findall(
+            r"challenge number:\s*(\d+)",
+            BeautifulSoup(challenge["body"], "html.parser").get_text(
+                " ", strip=True
+            ),
+            re.IGNORECASE,
+        )
+        if len(numbers) != 1:
+            raise FastPathError("gatekeeper challenge number is ambiguous")
+        number = int(numbers[0])
+        increment = int(increment_text)
+        modulus = int(modulus_text)
+        if number < 0 or increment < 0 or not 2 <= modulus <= 2_147_483_647:
+            raise FastPathError("gatekeeper arithmetic parameters are invalid")
+        response = (number * number + increment) % modulus
+        final = _fast_http_page(
+            context,
+            answer_url,
+            session=session,
+            method="POST",
+            form={field: str(response)},
+        )
+        candidates = _explicit_web_tokens(
+            final["body"], context.fingerprint.prompt
+        )
+        if len(candidates) != 1:
+            raise FastPathError(
+                f"gatekeeper response contained {len(candidates)} tokens"
+            )
+        return (
+            next(iter(candidates)),
+            (
+                "preserved one session across challenge GET and answer POST; "
+                "parsed and applied the server-stated modular formula"
+            ),
+            0.999,
+        )
+
+
+class InitiationHandler(BaseHandler):
+    name = "initiation"
+    title = "Initiation"
+    category = "The Dark Web"
+    answer_formats = ("exact",)
+    prompt_phrases = (
+        "complete the initiation",
+        "multi-step",
+        "stateful ritual",
+        "follow all of them exactly",
+        "starts with init-",
+    )
+    timeout_seconds = 40.0
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, set())
+        starts = _web_trail_starts(
+            context.fingerprint.prompt, context.runtime.base_url
+        )
+        if len(starts) != 1:
+            raise FastPathError("initiation start URL is ambiguous")
+        session = "fast-initiation"
+        codename = "codexagent"
+        first = _fast_http_page(context, starts[0], session=session)
+        first_text = BeautifulSoup(first["body"], "html.parser").get_text(
+            " ", strip=True
+        )
+        registration = re.search(
+            r"post a form to (https?://\S+) with field [\"']([^\"']+)[\"']",
+            first_text,
+            re.IGNORECASE,
+        )
+        if not registration:
+            raise FastPathError("initiation registration instruction is missing")
+        register_url = registration.group(1).rstrip(".,;")
+        register_field = registration.group(2)
+        _require_same_host(register_url, context.runtime.allowed_host)
+        second = _fast_http_page(
+            context,
+            register_url,
+            session=session,
+            method="POST",
+            form={register_field: codename},
+        )
+        second_text = BeautifulSoup(second["body"], "html.parser").get_text(
+            " ", strip=True
+        )
+        books = re.findall(
+            r"https?://[^\s,]+/guestbook/([A-Za-z0-9_-]+)",
+            second_text,
+        )
+        order_match = re.search(
+            r"assemble the code in this order\s*:\s*([A-Za-z0-9_, ]+?)\.",
+            second_text,
+            re.IGNORECASE,
+        )
+        verify_match = re.search(
+            r"post it to (https?://\S+) as field [\"']([^\"']+)[\"']",
+            second_text,
+            re.IGNORECASE,
+        )
+        if (
+            len(books) != 3
+            or len(set(books)) != 3
+            or not order_match
+            or not verify_match
+        ):
+            raise FastPathError("initiation guest-book instruction is malformed")
+        book_urls = {
+            name: _one_same_host_url(
+                second_text,
+                context.runtime.allowed_host,
+                suffix=f"/guestbook/{name}",
+            )
+            for name in books
+        }
+        order = [
+            value.strip()
+            for value in order_match.group(1).split(",")
+            if value.strip()
+        ]
+        if len(order) != 3 or set(order) != set(book_urls):
+            raise FastPathError("initiation fragment order is inconsistent")
+        fragments: dict[str, str] = {}
+        for name, url in book_urls.items():
+            page = _fast_http_page(context, url, session=session)
+            soup = BeautifulSoup(page["body"], "html.parser")
+            matches: list[str] = []
+            for item in soup.find_all("li"):
+                line = item.get_text(" ", strip=True)
+                if re.search(
+                    rf"\bsigned,\s*{re.escape(codename)}\b",
+                    line,
+                    re.IGNORECASE,
+                ):
+                    matches.extend(re.findall(r"\b\d{4}\b", line))
+            if len(matches) != 1:
+                raise FastPathError(
+                    f"guest book {name!r} has {len(matches)} matching fragments"
+                )
+            fragments[name] = matches[0]
+        code = "".join(fragments[name] for name in order)
+        if not re.fullmatch(r"\d{12}", code):
+            raise FastPathError("assembled verification code is malformed")
+        verify_url = verify_match.group(1).rstrip(".,;")
+        verify_field = verify_match.group(2)
+        _require_same_host(verify_url, context.runtime.allowed_host)
+        third = _fast_http_page(
+            context,
+            verify_url,
+            session=session,
+            method="POST",
+            form={verify_field: code},
+        )
+        third_text = BeautifulSoup(third["body"], "html.parser").get_text(
+            " ", strip=True
+        )
+        rooms_match = re.search(
+            r"exact order\s*:\s*([A-Za-z0-9_, ]+?)\.",
+            third_text,
+            re.IGNORECASE,
+        )
+        template_match = re.search(
+            r"(https?://\S+/room/)<name>",
+            third_text,
+            re.IGNORECASE,
+        )
+        header_match = re.search(
+            r"header\s+([A-Za-z0-9-]+):\s*<your codename>",
+            third_text,
+            re.IGNORECASE,
+        )
+        if not rooms_match or not template_match or not header_match:
+            raise FastPathError("initiation room-walk instruction is malformed")
+        rooms = [
+            value.strip()
+            for value in rooms_match.group(1).split(",")
+            if value.strip()
+        ]
+        if (
+            len(rooms) != 4
+            or len(set(rooms)) != 4
+            or any(not re.fullmatch(r"[a-z]+", room) for room in rooms)
+        ):
+            raise FastPathError("initiation room order is unsafe")
+        room_base = template_match.group(1)
+        _require_same_host(room_base, context.runtime.allowed_host)
+        final = third
+        for room in rooms:
+            final = _fast_http_page(
+                context,
+                urljoin(room_base, room),
+                session=session,
+                headers={header_match.group(1): codename},
+            )
+        candidates = _explicit_web_tokens(
+            final["body"], context.fingerprint.prompt
+        )
+        if len(candidates) != 1:
+            raise FastPathError(
+                f"initiation response contained {len(candidates)} tokens"
+            )
+        return (
+            next(iter(candidates)),
+            (
+                "followed the server-stated registration, three-fragment order, "
+                "verification POST, and four-room header-authenticated walk"
+            ),
+            0.999,
+        )
+
+
+class MembersOnlyHandler(BaseHandler):
+    name = "members_only"
+    title = "Members Only"
+    category = "The Dark Web"
+    answer_formats = ("exact", "exact_ci")
+    prompt_phrases = (
+        "members-only vault",
+        "username:",
+        "password:",
+        "session cookie",
+    )
+    timeout_seconds = 24.0
+
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, set())
+        starts = _web_trail_starts(
+            context.fingerprint.prompt, context.runtime.base_url
+        )
+        credentials = re.search(
+            r"username:\s*(\S+)\s+password:\s*(\S+)",
+            context.fingerprint.prompt,
+            re.IGNORECASE,
+        )
+        if len(starts) != 1 or not credentials:
+            raise FastPathError("login URL or credentials are ambiguous")
+        username, password = (
+            value.rstrip(".,;") for value in credentials.groups()
+        )
+        session = "fast-members-only"
+        first = _fast_http_page(context, starts[0], session=session)
+        soup = BeautifulSoup(first["body"], "html.parser")
+        forms = [
+            form
+            for form in soup.find_all("form")
+            if form.find(
+                "input", attrs={"type": re.compile("^password$", re.IGNORECASE)}
+            )
+        ]
+        if len(forms) != 1:
+            raise FastPathError("expected exactly one password form")
+        form = forms[0]
+        payload: dict[str, str] = {}
+        username_field = ""
+        password_field = ""
+        for input_tag in form.find_all("input"):
+            name = str(input_tag.get("name") or "")
+            if not name:
+                continue
+            input_type = str(input_tag.get("type") or "text").lower()
+            value = str(input_tag.get("value") or "")
+            if input_type == "hidden":
+                payload[name] = value
+            elif input_type == "password":
+                if password_field:
+                    raise FastPathError("multiple password fields are ambiguous")
+                password_field = name
+            elif input_type in {"text", "email"} and not username_field:
+                username_field = name
+        if not username_field or not password_field:
+            raise FastPathError("login fields could not be identified")
+        payload[username_field] = username
+        payload[password_field] = password
+        action = urljoin(
+            first["url"], str(form.get("action") or first["url"])
+        )
+        if urlparse(action).hostname != context.runtime.allowed_host:
+            raise FastPathError("login form leaves the event host")
+        method = str(form.get("method") or "post").upper()
+        if method not in {"POST", "GET"}:
+            raise FastPathError("unsupported login form method")
+        logged_in = _fast_http_page(
+            context,
+            action,
+            session=session,
+            method=method,
+            form=payload if method == "POST" else None,
+            params=payload if method == "GET" else None,
+        )
+        queue = deque([logged_in])
+        seen = {_normalized_web_url(first["url"])}
+        candidates: set[str] = set()
+        pages = 0
+        while queue and pages < 12:
+            context.check()
+            page = queue.popleft()
+            normalized = _normalized_web_url(page["url"])
+            if normalized in seen and page is not logged_in:
+                continue
+            seen.add(normalized)
+            pages += 1
+            candidates.update(
+                _explicit_web_tokens(
+                    page["body"], context.fingerprint.prompt
+                )
+            )
+            for link in _same_host_links(
+                page["body"], page["url"], context.runtime.allowed_host
+            ):
+                if _normalized_web_url(link) not in seen:
+                    queue.append(
+                        _fast_http_page(context, link, session=session)
+                    )
+        if queue:
+            raise FastPathError("members-only crawl exceeded page limit")
+        if len(candidates) != 1:
+            raise FastPathError(
+                f"expected one vault token, found {len(candidates)}"
+            )
+        return (
+            next(iter(candidates)),
+            (
+                f"submitted one same-host login form with preserved cookies; "
+                f"searched {pages} authenticated pages and found one vault token"
+            ),
+            0.997,
+        )
+
+
 class BoundedWebTrailHandler(BaseHandler):
     """Replay a read-only, same-session link trail and extract one explicit token."""
 
@@ -1172,29 +2001,21 @@ class BoundedWebTrailHandler(BaseHandler):
             if normalized in seen:
                 continue
             seen.add(normalized)
-            raw_result = context.runtime.execute(
-                "http_request",
-                {
-                    "url": target,
-                    "session": f"fast-{self.name}",
-                    "method": "GET",
-                    "follow_redirects": True,
-                    "timeout": 5,
-                },
+            page = _fast_http_page(
+                context, target, session=f"fast-{self.name}"
             )
-            result = json.loads(raw_result)
-            if not result.get("ok"):
-                continue
-            status = int(result.get("status") or 0)
-            artifact_id = str(result.get("body_artifact") or "")
-            if status >= 400 or not artifact_id:
-                continue
-            body = context.runtime.artifacts.get(artifact_id)
             successful_pages += 1
-            candidates.update(_explicit_web_tokens(body, prompt))
+            candidates.update(_explicit_web_tokens(page["body"], prompt))
 
-            current = str(result.get("url") or target)
-            for link in _same_host_links(body, current, context.runtime.allowed_host):
+            links = _same_host_links(
+                page["body"], page["url"], context.runtime.allowed_host
+            )
+            links.extend(
+                _same_host_header_links(
+                    page["headers"], page["url"], context.runtime.allowed_host
+                )
+            )
+            for link in links:
                 if _normalized_web_url(link) not in seen:
                     queue.append(link)
 
@@ -1221,6 +2042,57 @@ class DeepPagesHandler(BoundedWebTrailHandler):
     name = "deep_pages"
     title = "Deep Pages"
 
+    def solve(self, context: FastPathContext) -> tuple[str, str, float]:
+        _require_files(context.fingerprint, set())
+        starts = _web_trail_starts(
+            context.fingerprint.prompt, context.runtime.base_url
+        )
+        if len(starts) != 1:
+            raise FastPathError("deep-pages start URL is ambiguous")
+        target = starts[0]
+        seen: set[str] = set()
+        for page_number in range(1, self.max_pages + 1):
+            context.check()
+            normalized = _normalized_web_url(target)
+            if normalized in seen:
+                raise FastPathError("deep-pages trail contains a cycle")
+            seen.add(normalized)
+            page = _fast_http_page(
+                context, target, session="fast-deep_pages"
+            )
+            soup = BeautifulSoup(page["body"], "html.parser")
+            next_links = []
+            for anchor in soup.find_all("a"):
+                label = _normalize(anchor.get_text(" ", strip=True))
+                if label != "next":
+                    continue
+                absolute = urljoin(
+                    page["url"], str(anchor.get("href") or "")
+                )
+                if urlparse(absolute).hostname == context.runtime.allowed_host:
+                    next_links.append(absolute)
+            if len(next_links) > 1:
+                raise FastPathError("deep-pages page has multiple next links")
+            if next_links:
+                target = next_links[0]
+                continue
+            candidates = _explicit_web_tokens(
+                page["body"], context.fingerprint.prompt
+            )
+            if len(candidates) != 1:
+                raise FastPathError(
+                    f"terminal deep page has {len(candidates)} tokens"
+                )
+            return (
+                next(iter(candidates)),
+                (
+                    f"followed exactly one labeled next link per page across "
+                    f"{page_number} pages; terminal page had one token"
+                ),
+                0.997,
+            )
+        raise FastPathError("deep-pages trail exceeded the bounded page limit")
+
 
 class BreadcrumbsHandler(BoundedWebTrailHandler):
     name = "breadcrumbs"
@@ -1229,11 +2101,15 @@ class BreadcrumbsHandler(BoundedWebTrailHandler):
 
 HANDLERS: tuple[FastPathHandler, ...] = (
     DeepPagesHandler(),
+    GatekeeperHandler(),
+    InitiationHandler(),
+    MembersOnlyHandler(),
     BreadcrumbsHandler(),
     DirtyLedgerHandler(),
     EventHorizonHandler(),
     JoinTheDotsHandler(),
     SessionHunterHandler(),
+    ThirtySystemsHandler(),
     LayerCakeHandler(),
     LockedBoxHandler(),
     HiddenPixelsHandler(),
@@ -1245,15 +2121,53 @@ HANDLERS: tuple[FastPathHandler, ...] = (
     LivingDocumentHandler(),
     TrustTheErrataHandler(),
     SpaghettiHandler(),
+    SpecVsCodeHandler(),
     TinyVMHandler(),
+    FixAndRunHandler(),
+    QuintupleFaultHandler(),
     CongruentialCascadeHandler(),
+    CongruentialWorkfactorHandler(),
     SquarefreeCensusHandler(),
     ProofOfWorkHandler(),
+    NeedleInTwoTo44Handler(),
+    TravelingSalesmanHandler(),
 )
 
 REGISTERED_TITLES = frozenset(
     " ".join(handler.title.lower().split()) for handler in HANDLERS
 )
+
+CPU_HEAVY_FAST_PATH_TITLES = frozenset(
+    {
+        "congruential cascade",
+        "squarefree census",
+        "proof of work",
+        "needle in 2^44",
+        "traveling salesman",
+    }
+)
+
+FAST_PATH_EXPECTED_SECONDS = {
+    "deep pages": 4.0,
+    "members only": 5.0,
+    "breadcrumbs": 6.0,
+    "the gatekeeper": 4.0,
+    "initiation": 12.0,
+    "trust the errata": 0.1,
+    "crib sheet": 0.1,
+    "spec vs code": 1.0,
+    "fix and run": 2.0,
+    "quintuple fault": 2.0,
+    "thirty systems": 4.0,
+    "congruential cascade": 5.0,
+    "squarefree census": 8.0,
+    "proof of work": 15.0,
+    "needle in 2^44": 40.0,
+    # The real 90-city qualifier fixture completes in about 0.04s. Keep a
+    # conservative floor for download/fingerprint overhead without making the
+    # scheduler treat this as a model-scale search.
+    "traveling salesman": 0.1,
+}
 
 
 class FastPathDispatcher:
@@ -1326,6 +2240,7 @@ class FastPathDispatcher:
                 csv.Error,
                 json.JSONDecodeError,
                 BadZipFile,
+                tarfile.TarError,
                 binascii.Error,
                 struct.error,
                 zlib.error,
@@ -1342,6 +2257,14 @@ class FastPathDispatcher:
 
 def is_registered_fast_path_title(title: str) -> bool:
     return _normalize(title) in REGISTERED_TITLES
+
+
+def is_cpu_heavy_fast_path_title(title: str) -> bool:
+    return _normalize(title) in CPU_HEAVY_FAST_PATH_TITLES
+
+
+def fast_path_expected_seconds(title: str) -> float | None:
+    return FAST_PATH_EXPECTED_SECONDS.get(_normalize(title))
 
 
 def _web_trail_starts(prompt: str, base_url: str) -> list[str]:
@@ -1370,10 +2293,118 @@ def _web_trail_starts(prompt: str, base_url: str) -> list[str]:
     return starts[:8]
 
 
+def _fast_http_page(
+    context: FastPathContext,
+    url: str,
+    *,
+    session: str,
+    method: str = "GET",
+    form: dict[str, str] | None = None,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    context.check()
+    raw = context.runtime.execute(
+        "http_request",
+        {
+            "url": url,
+            "session": session,
+            "method": method,
+            "form": form,
+            "params": params,
+            "headers": headers,
+            "follow_redirects": True,
+            "timeout": 5,
+        },
+    )
+    result = json.loads(raw)
+    status = int(result.get("status") or 0)
+    artifact_id = str(result.get("body_artifact") or "")
+    if not result.get("ok") or not 200 <= status < 400 or not artifact_id:
+        raise FastPathError("same-host HTTP request failed")
+    return {
+        "url": str(result.get("url") or url),
+        "headers": dict(result.get("headers") or {}),
+        "body": context.runtime.artifacts.get(artifact_id),
+    }
+
+
+def _require_same_host(url: str, allowed_host: str | None) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname != allowed_host:
+        raise FastPathError("instruction URL leaves the event host")
+
+
+def _one_same_host_url(
+    text: str, allowed_host: str | None, *, suffix: str
+) -> str:
+    matches = {
+        value.rstrip(".,;")
+        for value in re.findall(r"https?://[^\s,]+", text)
+        if value.rstrip(".,;").endswith(suffix)
+    }
+    if len(matches) != 1:
+        raise FastPathError(f"expected one same-host URL ending {suffix!r}")
+    result = next(iter(matches))
+    _require_same_host(result, allowed_host)
+    return result
+
+
 def _same_host_links(body: str, current_url: str, allowed_host: str | None) -> list[str]:
     soup = BeautifulSoup(body, "html.parser")
     raw_links = [str(tag.get("href") or "") for tag in soup.find_all("a")]
     raw_links.extend(re.findall(r"https?://[^\s)\]}>'\"]+", body))
+    for meta in soup.find_all("meta"):
+        if str(meta.get("http-equiv") or "").lower() != "refresh":
+            continue
+        content = str(meta.get("content") or "")
+        match = re.search(
+            r"\burl\s*=\s*['\"]?([^'\";\s]+)", content, re.IGNORECASE
+        )
+        if match:
+            raw_links.append(match.group(1))
+    raw_links.extend(
+        re.findall(
+            (
+                r"(?:window\.)?location(?:\.href)?\s*=\s*"
+                r"['\"]([^'\"]+)['\"]"
+            ),
+            body,
+            flags=re.IGNORECASE,
+        )
+    )
+    raw_links.extend(
+        re.findall(
+            (
+                r"(?:next|next_url|url|path|href|location)\s*"
+                r"(?:is|:|=)\s*['\"]?(/[A-Za-z0-9_./?=&%:+~-]+)"
+            ),
+            body,
+            flags=re.IGNORECASE,
+        )
+    )
+    for comment in soup.find_all(string=lambda value: isinstance(value, Comment)):
+        raw_links.extend(
+            re.findall(
+                r"https?://[^\s)\]}>'\"]+|/[A-Za-z0-9_./?=&%:+~-]{3,}",
+                str(comment),
+            )
+        )
+    try:
+        parsed_json = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        parsed_json = None
+    raw_links.extend(_json_web_pointers(parsed_json))
+    for candidate in re.findall(
+        r"(?<![A-Za-z0-9+/])([A-Za-z0-9+/]{8,256}={0,2})(?![A-Za-z0-9+/])",
+        body,
+    ):
+        try:
+            decoded = base64.b64decode(candidate, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            continue
+        if decoded.startswith(("/", "http://", "https://")):
+            raw_links.append(decoded.strip())
     links: list[str] = []
     seen: set[str] = set()
     for raw in raw_links:
@@ -1387,6 +2418,54 @@ def _same_host_links(body: str, current_url: str, allowed_host: str | None) -> l
             seen.add(normalized)
             links.append(absolute)
     return links
+
+
+def _json_web_pointers(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        output: list[str] = []
+        for key, item in value.items():
+            normalized = _normalize(str(key)).replace(" ", "_")
+            if normalized in {
+                "next",
+                "next_url",
+                "url",
+                "path",
+                "href",
+                "location",
+                "redirect",
+            } and isinstance(item, str):
+                output.append(item)
+            elif isinstance(item, (dict, list)):
+                output.extend(_json_web_pointers(item))
+        return output
+    if isinstance(value, list):
+        return [
+            pointer
+            for item in value
+            for pointer in _json_web_pointers(item)
+        ]
+    return []
+
+
+def _same_host_header_links(
+    headers: dict[str, Any],
+    current_url: str,
+    allowed_host: str | None,
+) -> list[str]:
+    raw: list[str] = []
+    for key, value in headers.items():
+        normalized = key.lower()
+        text = str(value)
+        if normalized in {"location", "x-next", "x-next-url", "refresh"}:
+            raw.append(text.rsplit("url=", 1)[-1].strip(" '\""))
+        elif normalized == "link":
+            raw.extend(re.findall(r"<([^>]+)>", text))
+    output: list[str] = []
+    for value in raw:
+        absolute = urljoin(current_url, value)
+        if urlparse(absolute).hostname == allowed_host:
+            output.append(absolute)
+    return output
 
 
 def _normalized_web_url(value: str) -> str:
@@ -1538,15 +2617,23 @@ def _fingerprint_file(
     if suffix in {".csv", ".tsv"}:
         delimiter = "\t" if suffix == ".tsv" else ","
         with path.open("r", encoding="utf-8", newline="") as stream:
-            header = next(csv.reader(stream, delimiter=delimiter), [])
+            header_line = stream.readline(65_537)
+        if len(header_line) > 65_536:
+            raise ValueError("delimited header exceeds inspection limit")
+        header = next(csv.reader([header_line], delimiter=delimiter), [])
         columns = tuple(value.strip() for value in header)
         kind = "delimited"
     elif suffix == ".jsonl":
         keys: set[str] = set()
         with path.open("r", encoding="utf-8") as stream:
             sampled = 0
-            for line in stream:
+            while sampled < 3:
                 cancellation.check()
+                line = stream.readline(65_537)
+                if not line:
+                    break
+                if len(line) > 65_536:
+                    raise ValueError("JSONL sample line exceeds inspection limit")
                 if not line.strip():
                     continue
                 value = json.loads(line)
@@ -1554,8 +2641,6 @@ def _fingerprint_file(
                     raise TypeError("JSONL sample is not an object")
                 keys.update(str(key) for key in value)
                 sampled += 1
-                if sampled >= 3:
-                    break
         json_keys = tuple(sorted(keys))
         kind = "jsonl"
     elif suffix == ".json":
@@ -1644,7 +2729,7 @@ def _parse_money(value: str) -> Decimal | None:
 
 
 def _dirty_ledger_decimal(
-    path: Path, context: FastPathContext
+    path: Path, target_status: str, context: FastPathContext
 ) -> tuple[Decimal, int]:
     total = Decimal(0)
     count = 0
@@ -1655,7 +2740,7 @@ def _dirty_ledger_decimal(
         for index, row in enumerate(reader):
             if index % 250 == 0:
                 context.check()
-            if row.get("status") != "pending":
+            if row.get("status") != target_status:
                 continue
             amount = _parse_money(str(row.get("amount") or ""))
             if amount is not None:
@@ -1664,7 +2749,9 @@ def _dirty_ledger_decimal(
     return total, count
 
 
-def _dirty_ledger_cents(path: Path, context: FastPathContext) -> tuple[int, int]:
+def _dirty_ledger_cents(
+    path: Path, target_status: str, context: FastPathContext
+) -> tuple[int, int]:
     total = 0
     count = 0
     with path.open("r", encoding="utf-8", newline="") as stream:
@@ -1675,7 +2762,7 @@ def _dirty_ledger_cents(path: Path, context: FastPathContext) -> tuple[int, int]
                 continue
             if index % 250 == 0:
                 context.check()
-            if len(row) != 3 or row[1] != "pending":
+            if len(row) != 3 or row[1] != target_status:
                 continue
             amount = _parse_money(row[2])
             if amount is not None:
@@ -1685,6 +2772,102 @@ def _dirty_ledger_cents(path: Path, context: FastPathContext) -> tuple[int, int]
                 total += int(cents)
                 count += 1
     return total, count
+
+
+def _regional_fx_rates(raw: bytes) -> dict[str, Decimal]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise FastPathError("fx.csv is not UTF-8") from exc
+    reader = csv.DictReader(io.StringIO(text))
+    if set(reader.fieldnames or ()) != {"region", "currency", "usd_per_unit"}:
+        raise FastPathError("fx.csv schema is unexpected")
+    rates: dict[str, Decimal] = {}
+    for row in reader:
+        region = str(row.get("region") or "")
+        currency = str(row.get("currency") or "")
+        try:
+            rate = Decimal(str(row.get("usd_per_unit") or "").strip())
+        except InvalidOperation as exc:
+            raise FastPathError("fx.csv contains an invalid rate") from exc
+        if (
+            not re.fullmatch(r"[A-Z]{2}", region)
+            or not currency
+            or rate <= 0
+            or region in rates
+        ):
+            raise FastPathError("fx.csv row invariants failed")
+        rates[region] = rate
+    if len(rates) != 4:
+        raise FastPathError("fx.csv must contain four regions")
+    return rates
+
+
+def _regional_sales_total(
+    archive: ZipFile,
+    names: list[str],
+    rates: dict[str, Decimal],
+    context: FastPathContext,
+) -> tuple[Decimal, list[tuple[str, str, Decimal]]]:
+    revenue_names = {"amount", "amt", "value", "gross"}
+    transaction_names = {"txn_id", "order_id", "ref", "record_id"}
+    seen: set[str] = set()
+    kept: list[tuple[str, str, Decimal]] = []
+    total = Decimal(0)
+    for file_index, name in enumerate(sorted(names)):
+        context.check()
+        region_match = re.fullmatch(r"sales_([A-Z]{2})_\d{3}\.csv", name)
+        if not region_match or region_match.group(1) not in rates:
+            raise FastPathError("sales filename has an unknown region")
+        region = region_match.group(1)
+        try:
+            lines = archive.read(name).decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise FastPathError("sales export is not UTF-8") from exc
+        header_index = next(
+            (index for index, line in enumerate(lines) if not line.startswith("#")),
+            None,
+        )
+        if header_index is None:
+            raise FastPathError("sales export has no header")
+        header = next(csv.reader([lines[header_index]]), [])
+        if not header or len(set(header)) != len(header):
+            raise FastPathError("sales header is empty or duplicated")
+        revenue_columns = [value for value in header if value in revenue_names]
+        transaction_columns = [
+            value for value in header if value in transaction_names
+        ]
+        if len(revenue_columns) != 1 or len(transaction_columns) != 1:
+            raise FastPathError("sales columns are ambiguous")
+        revenue_index = header.index(revenue_columns[0])
+        transaction_index = header.index(transaction_columns[0])
+        for line_index, line in enumerate(lines[header_index + 1 :], 1):
+            if (file_index * 1_000 + line_index) % 250 == 0:
+                context.check()
+            try:
+                row = next(csv.reader([line]))
+            except csv.Error:
+                continue
+            if len(row) != len(header) or not row or row[0] == "TOTAL":
+                continue
+            transaction_id = row[transaction_index]
+            if not transaction_id:
+                raise FastPathError("sales row has an empty transaction id")
+            if transaction_id in seen:
+                continue
+            cleaned = row[revenue_index].strip().replace(",", "")
+            try:
+                amount = Decimal(cleaned)
+            except InvalidOperation as exc:
+                raise FastPathError("sales row has invalid revenue") from exc
+            if not amount.is_finite():
+                raise FastPathError("sales row has non-finite revenue")
+            seen.add(transaction_id)
+            kept.append((transaction_id, region, amount))
+            total += amount * rates[region]
+    if not kept:
+        raise FastPathError("regional archive produced no transactions")
+    return total, kept
 
 
 def _utc_datetime(value: str) -> datetime:
@@ -1741,6 +2924,328 @@ def _unique_token(data: bytes, pattern: str) -> str | None:
         return None
     matches = set(re.findall(pattern, text))
     return next(iter(matches)) if len(matches) == 1 else None
+
+
+_REPAIR_FUNCTIONS = {
+    "core": {
+        "top_score",
+        "largest_token",
+        "running_min",
+        "unique_sorted",
+        "rank_words",
+    },
+    "alpha": {"net_price", "col_sums"},
+    "beta": {"chunked", "avg_ratio"},
+    "gamma": {"bundle", "rank_scores"},
+    "delta": {"local_day"},
+}
+
+
+def _solve_repair_archive(
+    context: FastPathContext,
+    expected_members: set[str],
+    expected_modules: set[str],
+) -> tuple[str, int]:
+    _require_files(context.fingerprint, {"project.tar.gz"})
+    archive_file = _require_file(context.fingerprint, "project.tar.gz")
+    if not archive_file.magic_hex.startswith("1f8b"):
+        raise FastPathError("project.tar.gz does not have gzip magic")
+    sources = _bounded_tar_sources(context)
+    if set(sources) != expected_members:
+        raise FastPathError("repair archive manifest is unexpected")
+    selftest = sources["proj/selftest.py"]
+    compact = re.sub(r"\s+", "", selftest)
+    required_formulas = (
+        "hashlib.sha256(repr(value).encode()).hexdigest()[:10]",
+        '"MAGIC-"+hashlib.sha256((repr(results)+SALT).encode()).hexdigest()[:12].upper()',
+    )
+    if not all(formula in compact for formula in required_formulas):
+        raise FastPathError("self-test digest formula is not the known family")
+    assignments = _literal_assignments(selftest)
+    salt = assignments.get("SALT")
+    cases = assignments.get("CASES")
+    if not isinstance(salt, str) or not re.fullmatch(r"[A-Z0-9]{16}", salt):
+        raise FastPathError("self-test salt is malformed")
+    if not isinstance(cases, list) or not 2 <= len(cases) <= 64:
+        raise FastPathError("self-test cases are malformed")
+    allowed_functions = {
+        (module, function)
+        for module in expected_modules
+        for function in _REPAIR_FUNCTIONS[module]
+    }
+    observed_functions: Counter[tuple[str, str]] = Counter()
+    results: list[Any] = []
+    for index, case in enumerate(cases):
+        context.check()
+        if (
+            not isinstance(case, tuple)
+            or len(case) != 4
+            or not isinstance(case[0], str)
+            or not isinstance(case[1], str)
+            or not isinstance(case[2], tuple)
+            or not isinstance(case[3], str)
+            or not re.fullmatch(r"[a-f0-9]{10}", case[3])
+        ):
+            raise FastPathError(f"self-test case {index} is malformed")
+        module, function, args, expected_digest = case
+        if (module, function) not in allowed_functions:
+            raise FastPathError("self-test references an unexpected function")
+        source_name = f"proj/{module}.py"
+        _require_repair_contract(sources[source_name], function)
+        value = _repair_expected_value(function, args)
+        digest = hashlib.sha256(repr(value).encode()).hexdigest()[:10]
+        if digest != expected_digest:
+            raise FastPathError(
+                f"documented result disagrees with self-test case {index}"
+            )
+        observed_functions[(module, function)] += 1
+        results.append(value)
+    observed_set = set(observed_functions)
+    if (
+        not observed_set
+        or {module for module, _function in observed_set} != expected_modules
+        or (
+            expected_modules != {"core"}
+            and observed_set != allowed_functions
+        )
+        or (
+            expected_modules == {"core"}
+            and not 2 <= len(observed_set) <= len(_REPAIR_FUNCTIONS["core"])
+        )
+        or any(count < 2 for count in observed_functions.values())
+    ):
+        raise FastPathError("self-test does not cover every documented function twice")
+    answer = (
+        "MAGIC-"
+        + hashlib.sha256((repr(results) + salt).encode()).hexdigest()[:12].upper()
+    )
+    if not re.fullmatch(r"MAGIC-[A-F0-9]{12}", answer):
+        raise FastPathError("computed MAGIC line is malformed")
+    return answer, len(cases)
+
+
+def _bounded_tar_sources(context: FastPathContext) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    expanded = 0
+    with tarfile.open(context.path("project.tar.gz"), mode="r:gz") as archive:
+        members = archive.getmembers()
+        if len(members) > MAX_ARCHIVE_MEMBERS:
+            raise FastPathError("repair archive member count exceeds limit")
+        for member in members:
+            context.check()
+            pure = PurePosixPath(member.name)
+            if (
+                not member.name
+                or pure.is_absolute()
+                or ".." in pure.parts
+                or any(part in {"", "."} for part in pure.parts)
+                or member.issym()
+                or member.islnk()
+                or member.isdev()
+            ):
+                raise FastPathError("repair archive contains an unsafe member")
+            if member.isdir():
+                continue
+            if not member.isfile() or member.size < 0:
+                raise FastPathError("repair archive contains a non-regular member")
+            if member.name in sources:
+                raise FastPathError("repair archive contains a duplicate member")
+            expanded += member.size
+            if expanded > MAX_ARCHIVE_EXPANDED:
+                raise FastPathError("repair archive expanded size exceeds limit")
+            reader = archive.extractfile(member)
+            if reader is None:
+                raise FastPathError("repair archive member is unreadable")
+            raw = reader.read(member.size + 1)
+            if len(raw) != member.size:
+                raise FastPathError("repair archive member size changed while reading")
+            try:
+                sources[member.name] = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise FastPathError("repair archive source is not UTF-8") from exc
+    return sources
+
+
+def _literal_assignments(source: str) -> dict[str, Any]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise FastPathError("self-test is not valid Python") from exc
+    values: dict[str, Any] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in {"SALT", "CASES"}
+        ):
+            try:
+                values[node.targets[0].id] = ast.literal_eval(node.value)
+            except (ValueError, TypeError, SyntaxError) as exc:
+                raise FastPathError(
+                    f"{node.targets[0].id} is not a literal"
+                ) from exc
+    return values
+
+
+def _require_repair_contract(source: str, function: str) -> None:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise FastPathError("repair module is not valid Python") from exc
+    definitions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    node = definitions.get(function)
+    if node is None:
+        raise FastPathError(f"documented function {function!r} is missing")
+    contract = _normalize(
+        " ".join(
+            value
+            for value in (ast.get_docstring(tree), ast.get_docstring(node))
+            if value
+        )
+    )
+    markers = {
+        "top_score": ("highest score", "lexicographically smallest"),
+        "largest_token": ("decimal digit strings", "largest numeric value"),
+        "running_min": ("running minimums", "min(xs[:i+1])"),
+        "unique_sorted": ("distinct values", "sorted ascending"),
+        "rank_words": ("length ascending", "alphabetically ascending"),
+        "net_price": ("integer floor arithmetic", "discount_pct"),
+        "col_sums": ("rectangular", "column sums"),
+        "chunked": ("consecutive chunks", "final chunk may be shorter"),
+        "avg_ratio": ("mean of the exact ratios", "as a float"),
+        "bundle": ("new list", "never modify"),
+        "rank_scores": ("score descending", "equal scores keep"),
+        "local_day": ("local calendar day index", "3600", "86400"),
+    }[function]
+    if not all(marker in contract for marker in markers):
+        raise FastPathError(f"contract for {function!r} is not the known family")
+
+
+def _repair_expected_value(function: str, args: tuple[Any, ...]) -> Any:
+    if function == "top_score" and len(args) == 1:
+        pairs = args[0]
+        if not isinstance(pairs, list) or not pairs:
+            raise FastPathError("top_score arguments are malformed")
+        normalized = _name_score_pairs(pairs)
+        highest = max(score for _name, score in normalized)
+        return min(name for name, score in normalized if score == highest)
+    if function == "largest_token" and len(args) == 1:
+        tokens = args[0]
+        if (
+            not isinstance(tokens, list)
+            or not tokens
+            or any(not isinstance(value, str) or not value.isdecimal() for value in tokens)
+        ):
+            raise FastPathError("largest_token arguments are malformed")
+        return max(tokens, key=lambda value: int(value))
+    if function == "running_min" and len(args) == 1:
+        values = args[0]
+        if not isinstance(values, list) or not values:
+            raise FastPathError("running_min arguments are malformed")
+        _require_plain_ints(values)
+        output: list[int] = []
+        current = values[0]
+        for value in values:
+            current = min(current, value)
+            output.append(current)
+        return output
+    if function == "unique_sorted" and len(args) == 1:
+        values = args[0]
+        if not isinstance(values, list):
+            raise FastPathError("unique_sorted arguments are malformed")
+        _require_plain_ints(values)
+        return sorted(set(values))
+    if function == "rank_words" and len(args) == 1:
+        words = args[0]
+        if not isinstance(words, list) or any(
+            not isinstance(word, str) for word in words
+        ):
+            raise FastPathError("rank_words arguments are malformed")
+        return sorted(words, key=lambda word: (len(word), word))
+    if function == "net_price" and len(args) == 2:
+        cents, discount = args
+        _require_plain_ints((cents, discount))
+        if cents < 0 or not 0 <= discount <= 100:
+            raise FastPathError("net_price arguments are outside contract")
+        return cents - (cents * discount) // 100
+    if function == "col_sums" and len(args) == 1:
+        grid = args[0]
+        if (
+            not isinstance(grid, list)
+            or not grid
+            or any(not isinstance(row, list) or not row for row in grid)
+        ):
+            raise FastPathError("col_sums grid is malformed")
+        width = len(grid[0])
+        if any(len(row) != width for row in grid):
+            raise FastPathError("col_sums grid is not rectangular")
+        for row in grid:
+            _require_plain_ints(row)
+        return [sum(row[index] for row in grid) for index in range(width)]
+    if function == "chunked" and len(args) == 2:
+        values, size = args
+        if not isinstance(values, list):
+            raise FastPathError("chunked values are malformed")
+        _require_plain_ints((size,))
+        if size <= 0:
+            raise FastPathError("chunk size must be positive")
+        return [values[index : index + size] for index in range(0, len(values), size)]
+    if function == "avg_ratio" and len(args) == 1:
+        pairs = args[0]
+        if not isinstance(pairs, list) or not pairs:
+            raise FastPathError("avg_ratio arguments are malformed")
+        total = 0.0
+        for pair in pairs:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise FastPathError("avg_ratio pair is malformed")
+            numerator, denominator = pair
+            _require_plain_ints((numerator, denominator))
+            if denominator <= 0:
+                raise FastPathError("avg_ratio denominator is not positive")
+            total += numerator / denominator
+        return total / len(pairs)
+    if function == "bundle" and len(args) in {1, 2}:
+        item = args[0]
+        extras = [] if len(args) == 1 else args[1]
+        if not isinstance(item, str) or not isinstance(extras, list):
+            raise FastPathError("bundle arguments are malformed")
+        return [*extras, item]
+    if function == "rank_scores" and len(args) == 1:
+        rows = args[0]
+        if not isinstance(rows, list):
+            raise FastPathError("rank_scores arguments are malformed")
+        normalized = _name_score_pairs(rows)
+        return [name for name, _score in sorted(normalized, key=lambda row: -row[1])]
+    if function == "local_day" and len(args) == 2:
+        timestamp, offset = args
+        _require_plain_ints((timestamp, offset))
+        if not -24 <= offset <= 24:
+            raise FastPathError("timezone offset is outside contract")
+        return (timestamp + offset * 3600) // 86400
+    raise FastPathError(f"unsupported documented repair function {function!r}")
+
+
+def _name_score_pairs(values: list[Any]) -> list[tuple[str, int]]:
+    result: list[tuple[str, int]] = []
+    for pair in values:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise FastPathError("name-score pair is malformed")
+        name, score = pair
+        if not isinstance(name, str):
+            raise FastPathError("score name is not text")
+        _require_plain_ints((score,))
+        result.append((name, score))
+    return result
+
+
+def _require_plain_ints(values: Any) -> None:
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        raise FastPathError("expected plain integer arguments")
 
 
 def _validate_archive_paths(infos: list[Any]) -> None:
@@ -1981,34 +3486,60 @@ def _run_program(context: FastPathContext, command: list[str]) -> str:
         "PYTHONIOENCODING": "utf-8",
         "TASK_DIR": str(context.root),
     }
-    process = subprocess.Popen(
-        command,
-        cwd=context.root,
-        env=safe_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    while True:
-        if context.cancellation.cancelled:
-            _kill_process(process)
-            process.communicate()
-            context.cancellation.check()
-        if time.monotonic() > context.deadline:
-            _kill_process(process)
-            process.communicate()
-            raise FastPathDeadline("direct execution deadline exceeded")
-        try:
-            stdout, stderr = process.communicate(timeout=0.05)
-            break
-        except subprocess.TimeoutExpired:
-            continue
+    if (
+        len(command) >= 3
+        and Path(command[0]).resolve() == Path(sys.executable).resolve()
+        and command[1] == "-I"
+    ):
+        script = command[2]
+        arguments = [script, *command[3:]]
+        code = python_resource_prelude(
+            max(1, int(context.deadline - time.monotonic()))
+        ) + (
+            "import runpy, sys\n"
+            f"sys.path.insert(0, {str(context.root)!r})\n"
+            f"sys.argv = {arguments!r}\n"
+            f"runpy.run_path({script!r}, run_name='__main__')\n"
+        )
+        command = [sys.executable, "-I", "-c", code]
+    with (
+        tempfile.TemporaryFile() as stdout_file,
+        tempfile.TemporaryFile() as stderr_file,
+    ):
+        process = subprocess.Popen(
+            command,
+            cwd=context.root,
+            env=safe_env,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            start_new_session=True,
+        )
+        while True:
+            if context.cancellation.cancelled:
+                _kill_process(process)
+                process.wait()
+                context.cancellation.check()
+            if time.monotonic() > context.deadline:
+                _kill_process(process)
+                process.wait()
+                raise FastPathDeadline("direct execution deadline exceeded")
+            try:
+                process.wait(timeout=0.05)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        _kill_process(process)
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout_bytes = stdout_file.read(MAX_DIRECT_OUTPUT + 1)
+        stderr_bytes = stderr_file.read(MAX_DIRECT_OUTPUT + 1)
     context.check()
     if process.returncode != 0:
         raise FastPathError(f"subprocess exited with status {process.returncode}")
-    if len(stdout) > MAX_DIRECT_OUTPUT or len(stderr) > MAX_DIRECT_OUTPUT:
+    if len(stdout_bytes) > MAX_DIRECT_OUTPUT or len(stderr_bytes) > MAX_DIRECT_OUTPUT:
         raise FastPathError("subprocess output exceeds limit")
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
     if stderr.strip():
         raise FastPathError("subprocess wrote to stderr")
     lines = stdout.splitlines()
@@ -2018,8 +3549,6 @@ def _run_program(context: FastPathContext, command: list[str]) -> str:
 
 
 def _kill_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -2048,6 +3577,28 @@ def _lcg_sum(
     return total, accepted, value
 
 
+def _lcg_final_state(
+    x0: int, multiplier: int, increment: int, modulus: int, count: int
+) -> int:
+    """Apply an affine recurrence in O(log count) for an independent check."""
+
+    result_multiplier, result_increment = 1, 0
+    base_multiplier, base_increment = multiplier % modulus, increment % modulus
+    remaining = count
+    while remaining:
+        if remaining & 1:
+            result_multiplier, result_increment = (
+                base_multiplier * result_multiplier % modulus,
+                (base_multiplier * result_increment + base_increment) % modulus,
+            )
+        base_multiplier, base_increment = (
+            base_multiplier * base_multiplier % modulus,
+            (base_multiplier * base_increment + base_increment) % modulus,
+        )
+        remaining >>= 1
+    return (result_multiplier * x0 + result_increment) % modulus
+
+
 def _squarefree_count(
     low: int, high: int, digit_divisor: int, context: FastPathContext
 ) -> int:
@@ -2071,6 +3622,11 @@ def _squarefree_count(
         if first <= high:
             count = ((high - first) // square) + 1
             flags[first - low : high - low + 1 : square] = b"\x00" * count
+    sample_count = min(32, len(flags))
+    for sample in range(sample_count):
+        index = sample * (len(flags) - 1) // max(1, sample_count - 1)
+        if bool(flags[index]) != _is_squarefree_trial(low + index):
+            raise FastPathError("squarefree sieve disagrees with trial division")
     total = 0
     for index, flag in enumerate(flags):
         if index % 8_192 == 0:
@@ -2078,6 +3634,187 @@ def _squarefree_count(
         if flag and sum(int(char) for char in str(low + index)) % digit_divisor == 0:
             total += 1
     return total
+
+
+def _is_squarefree_trial(value: int) -> bool:
+    factor = 2
+    while factor * factor <= value:
+        if value % (factor * factor) == 0:
+            return False
+        factor += 1
+    return True
+
+
+def _fixed_cardinality_subset_sum(
+    values: list[int],
+    target: int,
+    subset_size: int,
+    context: FastPathContext,
+) -> list[int]:
+    midpoint = len(values) // 2
+    left = values[:midpoint]
+    right = values[midpoint:]
+    minimum_left = max(0, subset_size - len(right))
+    maximum_left = min(subset_size, len(left))
+    expected_left = subset_size * len(left) / len(values)
+    left_counts = sorted(
+        range(minimum_left, maximum_left + 1),
+        key=lambda value: (abs(value - expected_left), value),
+    )
+
+    def combinations_with_sum(source: list[int], count: int) -> Any:
+        for ordinal, indices in enumerate(
+            itertools.combinations(range(len(source)), count)
+        ):
+            if ordinal % 8_192 == 0:
+                context.check()
+            yield sum(source[index] for index in indices), indices
+
+    for left_count in left_counts:
+        context.check()
+        right_count = subset_size - left_count
+        left_combinations = math.comb(len(left), left_count)
+        right_combinations = math.comb(len(right), right_count)
+        if left_combinations <= right_combinations:
+            lookup: dict[int, tuple[int, ...]] = {}
+            for subtotal, indices in combinations_with_sum(left, left_count):
+                lookup.setdefault(subtotal, indices)
+            for subtotal, indices in combinations_with_sum(right, right_count):
+                match = lookup.get(target - subtotal)
+                if match is not None:
+                    return list(match) + [midpoint + index for index in indices]
+        else:
+            lookup = {}
+            for subtotal, indices in combinations_with_sum(right, right_count):
+                lookup.setdefault(subtotal, indices)
+            for subtotal, indices in combinations_with_sum(left, left_count):
+                match = lookup.get(target - subtotal)
+                if match is not None:
+                    return list(indices) + [
+                        midpoint + index for index in match
+                    ]
+        del lookup
+    raise FastPathError("no exact-cardinality subset found")
+
+
+def _tour_length(tour: list[int], distances: list[list[float]]) -> float:
+    return sum(
+        distances[tour[index]][tour[(index + 1) % len(tour)]]
+        for index in range(len(tour))
+    )
+
+
+def _nearest_neighbor_tour(
+    start: int, distances: list[list[float]], context: FastPathContext
+) -> list[int]:
+    remaining = set(range(len(distances)))
+    remaining.remove(start)
+    tour = [start]
+    while remaining:
+        context.check()
+        current = tour[-1]
+        next_point = min(
+            remaining,
+            key=lambda candidate: (distances[current][candidate], candidate),
+        )
+        remaining.remove(next_point)
+        tour.append(next_point)
+    return tour
+
+
+def _two_opt(
+    initial: list[int],
+    distances: list[list[float]],
+    threshold: float,
+    context: FastPathContext,
+) -> tuple[list[int], float]:
+    tour = list(initial)
+    length = _tour_length(tour, distances)
+    size = len(tour)
+    improved = True
+    passes = 0
+    while improved and time.monotonic() < context.deadline - 0.25:
+        improved = False
+        passes += 1
+        for left in range(size - 1):
+            if left % 8 == 0:
+                context.check()
+            a = tour[left]
+            b = tour[(left + 1) % size]
+            last_right = size - 1 if left == 0 else size
+            for right in range(left + 2, last_right):
+                c = tour[right]
+                d = tour[(right + 1) % size]
+                delta = (
+                    distances[a][c]
+                    + distances[b][d]
+                    - distances[a][b]
+                    - distances[c][d]
+                )
+                if delta < -1e-9:
+                    tour[left + 1 : right + 1] = reversed(
+                        tour[left + 1 : right + 1]
+                    )
+                    length += delta
+                    improved = True
+                    break
+            if improved or length <= threshold:
+                break
+        if passes > size * size:
+            raise FastPathError("2-opt failed to converge")
+    return tour, _tour_length(tour, distances)
+
+
+def _double_bridge(tour: list[int], iteration: int) -> list[int]:
+    size = len(tour)
+    quarter = size // 4
+    first = 1 + (iteration * 3) % max(1, quarter - 2)
+    second = quarter + (iteration * 5) % max(1, quarter - 2)
+    third = 2 * quarter + (iteration * 7) % max(1, quarter - 2)
+    return (
+        tour[:first]
+        + tour[second:third]
+        + tour[first:second]
+        + tour[third:]
+    )
+
+
+def _tsp_search(
+    distances: list[list[float]],
+    threshold: float,
+    context: FastPathContext,
+) -> tuple[list[int], float]:
+    best: list[int] = []
+    best_length = math.inf
+    starts = sorted(
+        range(len(distances)),
+        key=lambda index: (-sum(distances[index]), index),
+    )
+    for start in starts:
+        if time.monotonic() >= context.deadline - 0.5:
+            break
+        candidate = _nearest_neighbor_tour(start, distances, context)
+        candidate, length = _two_opt(
+            candidate, distances, threshold, context
+        )
+        if length < best_length:
+            best, best_length = candidate, length
+        if best_length <= threshold:
+            return best, best_length
+    iteration = 0
+    while best and time.monotonic() < context.deadline - 0.5:
+        candidate = _double_bridge(best, iteration)
+        candidate, length = _two_opt(
+            candidate, distances, threshold, context
+        )
+        if length < best_length:
+            best, best_length = candidate, length
+        if best_length <= threshold:
+            break
+        iteration += 1
+    if not best:
+        raise FastPathError("tour search produced no candidate")
+    return best, best_length
 
 
 def _base36(value: int) -> str:

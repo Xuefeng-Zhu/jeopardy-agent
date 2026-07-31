@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import replace
-from threading import Lock
+from dataclasses import dataclass, replace
+from pathlib import Path
+from threading import Lock, local
 from typing import Any
 
 from agent_types import (
@@ -60,6 +62,12 @@ TITLE_PLAYBOOKS = {
         "Replay the complete same-session HTTP chain programmatically. Preserve "
         "cookies, follow each same-host breadcrumb once, and extract the exact "
         "answer from the final response artifact."
+    ),
+    "fix and run": (
+        "Call extract_archive first, then list the extracted project. Run "
+        "proj/selftest.py once to capture the failure, compare the failing "
+        "function with its documented spec, make one minimal targeted fix, and "
+        "rerun the self-test. Record only the verified MAGIC line it prints."
     ),
     "needle in 2^44": (
         "Parse every numeric constraint before computing. Reduce the 2^44 search "
@@ -118,6 +126,17 @@ FINALIZATION_TOOLS = [
 ]
 
 
+@dataclass(slots=True)
+class _PreparedTask:
+    detail: dict[str, Any]
+    names: list[str]
+    runtime: TaskToolRuntime
+    fingerprint: TaskFingerprint
+    file_signature: tuple[tuple[str, int, int], ...]
+    fast_path_key: tuple[Any, ...] | None = None
+    fast_path_missed: bool = False
+
+
 class TileSolver:
     def __init__(
         self,
@@ -144,6 +163,11 @@ class TileSolver:
         self._disabled_fast_paths_lock = Lock()
         self._failure_reports: dict[str, str] = {}
         self._failure_reports_lock = Lock()
+        self._prepared: dict[str, _PreparedTask] = {}
+        self._prepared_lock = Lock()
+        self._client_local = local()
+        self._clients: list[Any] = []
+        self._clients_lock = Lock()
 
     def disable_fast_path(
         self, recipe_key: str, recipe_generation: int, handler: str
@@ -179,6 +203,26 @@ class TileSolver:
         with self._failure_reports_lock:
             self._failure_reports[task_id] = report[:1_200]
 
+    def discard_task_state(self, task_id: str) -> None:
+        with self._prepared_lock:
+            prepared = self._prepared.pop(task_id, None)
+        if prepared is not None:
+            prepared.runtime.close()
+
+    def close(self) -> None:
+        with self._prepared_lock:
+            prepared = list(self._prepared.values())
+            self._prepared.clear()
+        for state in prepared:
+            state.runtime.close()
+        with self._clients_lock:
+            clients = self._clients
+            self._clients = []
+        for client in clients:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+
     def solve(
         self,
         tile: Tile,
@@ -187,22 +231,19 @@ class TileSolver:
         cancellation: CancellationToken | None = None,
         attempt: int = 1,
         family_failure_hint: str = "",
+        prior_failure_hint: str = "",
     ) -> Candidate | None:
         self.pop_failure_report(tile.id)
         cancellation = cancellation or CancellationToken()
         cancellation.check()
-        detail = self.game.task(tile.id)
-        cancellation.check()
-        workdir = self.game.workdir(tile.id)
-        names = self.game.fetch_files(tile.id, detail)
-        cancellation.check()
-        runtime = TaskToolRuntime(workdir, self.game.BASE, cancellation)
+        prepared = self._prepare_task(tile, cancellation)
+        detail = prepared.detail
+        names = prepared.names
+        runtime = prepared.runtime
+        fingerprint = prepared.fingerprint
 
         answer_format = str(detail.get("answer_format") or "exact")
         category = str(detail.get("category") or tile.category)
-        fingerprint = TaskFingerprint.build(
-            tile, detail, names, runtime.root, cancellation
-        )
         self.game.log(f"{tile.id}: fingerprint {fingerprint.compact_summary()}")
         generator_fingerprint = fingerprint.generator_fingerprint
         compatible_recipe = None
@@ -256,40 +297,47 @@ class TileSolver:
             )
 
         if self.fast_paths_enabled:
-            outcome = self.fast_path_dispatcher.attempt(
-                tile,
-                detail,
-                names,
-                runtime,
-                disabled_handlers=self._disabled_handlers(
-                    tile.recipe_key, recipe_generation
-                ),
-                fingerprint=fingerprint,
-            )
-            self.game.log(
-                f"{tile.id}: fast path handler={outcome.handler or 'none'} "
-                f"outcome={outcome.status.value} "
-                f"elapsed={outcome.elapsed_seconds:.3f}s"
-            )
-            if outcome.status == FastPathStatus.SOLVED:
-                return Candidate(
-                    task_id=tile.id,
-                    answer=outcome.answer,
-                    answer_format=answer_format,
-                    category=category,
-                    points=int(detail.get("points") or tile.points),
-                    recipe_key=tile.recipe_key,
-                    recipe_generation=recipe_generation,
-                    confidence=outcome.confidence,
-                    evidence=outcome.evidence,
-                    source=outcome.source,
-                    strategy=f"fast:{outcome.handler}",
-                    verification_source=outcome.verification_source,
-                    generator_fingerprint=generator_fingerprint,
+            disabled = self._disabled_handlers(tile.recipe_key, recipe_generation)
+            fast_path_key = (prepared.file_signature, disabled)
+            if prepared.fast_path_key == fast_path_key and prepared.fast_path_missed:
+                self.game.log(
+                    f"{tile.id}: skipped unchanged deterministic fast-path miss"
                 )
-            self.game.log(
-                f"{tile.id}: deterministic fallback reason={outcome.reason}"
-            )
+            else:
+                outcome = self.fast_path_dispatcher.attempt(
+                    tile,
+                    detail,
+                    names,
+                    runtime,
+                    disabled_handlers=disabled,
+                    fingerprint=fingerprint,
+                )
+                prepared.fast_path_key = fast_path_key
+                prepared.fast_path_missed = outcome.status != FastPathStatus.SOLVED
+                self.game.log(
+                    f"{tile.id}: fast path handler={outcome.handler or 'none'} "
+                    f"outcome={outcome.status.value} "
+                    f"elapsed={outcome.elapsed_seconds:.3f}s"
+                )
+                if outcome.status == FastPathStatus.SOLVED:
+                    return Candidate(
+                        task_id=tile.id,
+                        answer=outcome.answer,
+                        answer_format=answer_format,
+                        category=category,
+                        points=int(detail.get("points") or tile.points),
+                        recipe_key=tile.recipe_key,
+                        recipe_generation=recipe_generation,
+                        confidence=outcome.confidence,
+                        evidence=outcome.evidence,
+                        source=outcome.source,
+                        strategy=f"fast:{outcome.handler}",
+                        verification_source=outcome.verification_source,
+                        generator_fingerprint=generator_fingerprint,
+                    )
+                self.game.log(
+                    f"{tile.id}: deterministic fallback reason={outcome.reason}"
+                )
 
         if self.fast_path_only:
             self.game.log(
@@ -334,11 +382,19 @@ class TileSolver:
                 "Do not repeat the same failing tool sequence. Choose a materially "
                 "different approach and validate it before record_answer."
             )
+        if prior_failure_hint:
+            prompt += (
+                "\n\nThe previous attempt failed at this boundary:\n"
+                f"{prior_failure_hint[:800]}\n"
+                "Address that specific failure; do not return the same candidate "
+                "or repeat the same rejected verification path."
+            )
         if self.verbose:
             self.game.log(f"{tile.id} solver prompt:\n{prompt}\n---")
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-        client = self.game.anthropic_client()
+        client = self._model_client()
+        tools = self._tools_for(category, names)
 
         turn_budget = self._turn_budget(tile.points)
         tool_counts: Counter[str] = Counter()
@@ -350,6 +406,9 @@ class TileSolver:
         last_turn_tools: list[str] = []
         turns_used = 0
         finalizer_used = False
+        consecutive_no_tool_turns = 0
+        repeated_error_signature: tuple[tuple[str, str], ...] | None = None
+        repeated_error_turns = 0
         final_turn = turn_budget + 1
         for turn in range(1, final_turn + 1):
             cancellation.check()
@@ -378,7 +437,7 @@ class TileSolver:
                     if finalizing
                     else BASE_SYSTEM_PROMPT
                 ),
-                "tools": FINALIZATION_TOOLS if finalizing else TOOL_SCHEMAS,
+                "tools": FINALIZATION_TOOLS if finalizing else tools,
                 "messages": list(messages),
             }
             response = self._model_call(client, request, cancellation)
@@ -395,6 +454,7 @@ class TileSolver:
 
             tool_results: list[dict[str, Any]] = []
             turn_tools: list[str] = []
+            turn_errors: list[tuple[str, str]] = []
             for block in response.content:
                 cancellation.check()
                 if getattr(block, "type", None) != "tool_use":
@@ -413,6 +473,10 @@ class TileSolver:
                     tool_errors += 1
                 if tool_name == "record_answer" and not parsed_result.get("ok"):
                     record_errors.append(str(parsed_result.get("error") or result)[:500])
+                if parsed_result and not parsed_result.get("ok", True):
+                    turn_errors.append(
+                        (tool_name, str(parsed_result.get("error") or "")[:300])
+                    )
                 if self.verbose:
                     self.game.log(
                         f"{tile.id} turn={turn} tool={tool_name} "
@@ -472,11 +536,26 @@ class TileSolver:
                 )
 
             if tool_results:
+                consecutive_no_tool_turns = 0
+                error_signature = tuple(turn_errors)
+                if error_signature and error_signature == repeated_error_signature:
+                    repeated_error_turns += 1
+                else:
+                    repeated_error_signature = error_signature or None
+                    repeated_error_turns = 1 if error_signature else 0
                 messages.append({"role": "user", "content": tool_results})
+                if repeated_error_turns >= 2:
+                    record_errors.append(
+                        "same failing tool sequence repeated twice; stopped early"
+                    )
+                    break
                 continue
 
             # A text-only response is not a candidate. Give the model one clear
             # recovery instruction within the normal turn budget.
+            consecutive_no_tool_turns += 1
+            if consecutive_no_tool_turns >= 2:
+                break
             messages.append(
                 {
                     "role": "user",
@@ -510,6 +589,118 @@ class TileSolver:
             f"record_answer_errors={errors}",
         )
         return None
+
+    def _prepare_task(
+        self, tile: Tile, cancellation: CancellationToken
+    ) -> _PreparedTask:
+        with self._prepared_lock:
+            prepared = self._prepared.get(tile.id)
+        if prepared is None:
+            detail = self._call_with_cancellation(
+                self.game.task, tile.id, cancellation=cancellation
+            )
+            cancellation.check()
+            workdir = self.game.workdir(tile.id)
+            names = self._call_with_cancellation(
+                self.game.fetch_files,
+                tile.id,
+                detail,
+                cancellation=cancellation,
+            )
+            cancellation.check()
+            runtime = TaskToolRuntime(workdir, self.game.BASE, cancellation)
+            signature = self._file_signature(runtime.root, names)
+            prepared = _PreparedTask(
+                detail=detail,
+                names=names,
+                runtime=runtime,
+                fingerprint=TaskFingerprint.build(
+                    tile, detail, names, runtime.root, cancellation
+                ),
+                file_signature=signature,
+            )
+            with self._prepared_lock:
+                self._prepared[tile.id] = prepared
+            return prepared
+
+        prepared.runtime.begin_attempt(cancellation)
+        signature = self._file_signature(prepared.runtime.root, prepared.names)
+        if signature != prepared.file_signature:
+            prepared.file_signature = signature
+            prepared.fingerprint = TaskFingerprint.build(
+                tile,
+                prepared.detail,
+                prepared.names,
+                prepared.runtime.root,
+                cancellation,
+            )
+            prepared.fast_path_key = None
+            prepared.fast_path_missed = False
+        return prepared
+
+    @staticmethod
+    def _call_with_cancellation(
+        function: Callable[..., Any], *args: Any, cancellation: CancellationToken
+    ) -> Any:
+        try:
+            parameters = inspect.signature(function).parameters.values()
+        except (TypeError, ValueError):
+            parameters = ()
+        if any(
+            parameter.name == "cancellation"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            return function(*args, cancellation=cancellation)
+        return function(*args)
+
+    @staticmethod
+    def _file_signature(
+        root: Path, names: list[str]
+    ) -> tuple[tuple[str, int, int], ...]:
+        signature = []
+        for name in names:
+            path = root / name
+            try:
+                stat_result = path.stat()
+            except OSError:
+                signature.append((name, -1, -1))
+            else:
+                signature.append(
+                    (name, stat_result.st_size, stat_result.st_mtime_ns)
+                )
+        return tuple(signature)
+
+    def _model_client(self) -> Any:
+        client = getattr(self._client_local, "client", None)
+        if client is None:
+            client = self.game.anthropic_client()
+            self._client_local.client = client
+            with self._clients_lock:
+                self._clients.append(client)
+        return client
+
+    @staticmethod
+    def _tools_for(category: str, names: list[str]) -> list[dict[str, Any]]:
+        selected = {
+            "list_files",
+            "inspect_file",
+            "read_file",
+            "search_files",
+            "search_artifact",
+            "run_python",
+            "record_answer",
+        }
+        if category == "The Dark Web":
+            selected.add("http_request")
+        if category in {"Ship It", "Heavy Compute"}:
+            selected.add("write_file")
+        archive_suffixes = (".zip", ".tar", ".tgz", ".tar.gz", ".gz")
+        if category in {"Ship It", "Cryptic"} or any(
+            name.lower().endswith(archive_suffixes) for name in names
+        ):
+            selected.add("extract_archive")
+        return [schema for schema in TOOL_SCHEMAS if schema.get("name") in selected]
 
     def _turn_budget(self, points: int) -> int:
         if points >= 500:
@@ -579,10 +770,17 @@ class TileSolver:
 
         if hasattr(client.messages, "stream"):
             with client.messages.stream(**request) as stream:
-                for _event in stream:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    cancellation.add_callback(close)
+                try:
+                    for _event in stream:
+                        cancellation.check()
                     cancellation.check()
-                cancellation.check()
-                return stream.get_final_message()
+                    return stream.get_final_message()
+                finally:
+                    if callable(close):
+                        cancellation.remove_callback(close)
         # Test doubles and older SDKs may expose only create(). Cancellation
         # still applies immediately before and after the blocking request.
         return client.messages.create(**request)

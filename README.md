@@ -156,6 +156,27 @@ Run the offline orchestration and tool tests without event credentials:
 python -m unittest discover -s tests -v
 ```
 
+Before Round 2, run the acceptance gates against a saved hosted log:
+
+```bash
+python round2_acceptance.py \
+  --logs /path/to/agent-logs.json \
+  --phase practice
+```
+
+Or fetch the current hosted log and health status using the configured
+credentials:
+
+```bash
+python round2_acceptance.py --live --phase practice
+```
+
+The gate fails closed unless every category starts within 10 seconds, the
+first candidate is queued within 3 seconds, the first worker batch contains
+distinct recipe families, candidate queue p95 is at most 15 seconds, fewer
+than 10% of outcomes are already claimed, no incorrect answer is submitted,
+and `agent.zip` exactly matches the runtime source files.
+
 The model is never given a submit tool. It must use task tools and finish with
 `record_answer`; the controller validates that candidate and resolves
 artifact-backed answers without asking the model to retype exact tokens.
@@ -166,6 +187,12 @@ layout, and magic bytes. It replays a learned recipe only on an exact match to
 that versioned generator fingerprint, then tries deterministic fast paths;
 malformed or ambiguous inputs fall through to Claude. Set `FAST_PATH_ONLY=1`
 with `DRY_RUN=1` to calibrate these paths while guaranteeing zero model calls.
+Observed high-cost families now bypass the model entirely when their full
+invariants match: Thirty Systems, Spec vs Code, Fix and Run, Quintuple Fault,
+Deep Pages, Members Only, Breadcrumbs, The Gatekeeper, Initiation, and the
+Congruential Cascade work-factor verdict. Archive repair paths parse literal
+self-test cases and recompute every documented result digest; stateful web
+paths preserve one bounded session and execute only same-host instructions.
 
 Model context is compact by construction. `inspect_file` returns table schemas,
 JSON shapes, log counts, and small samples; searches return bounded matches;
@@ -185,9 +212,12 @@ sibling worker, and learned Python replays must produce identical output twice;
 scored phases only reuse fingerprint recipes validated on a practice sibling.
 An incorrect replay invalidates only that exact fingerprint, not every recipe
 in its category and point tier.
-The scheduler reserves half its workers for 400/500 exploration and uses the
-rest for faster tiers. Unreplayed scored 400/500 candidates must also carry a
-separate verification artifact before the submission lane accepts them.
+The scheduler greedily covers race-critical board lanes: expected points per
+second is increased for nearly exhausted cells, deterministic or replay-ready
+work, and categories/cells not already covered by active workers. This avoids
+fixed family/tier batches while retaining cold-family and CPU-heavy concurrency
+caps. Unreplayed scored 400/500 candidates must also carry a separate
+verification artifact before the submission lane accepts them.
 
 Board polling continues while workers run. If an open tile disappears, the
 controller signals its worker immediately: streamed model responses are closed,

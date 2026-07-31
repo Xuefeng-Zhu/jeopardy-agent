@@ -20,6 +20,7 @@ import tarfile
 import tempfile
 import time
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -36,6 +37,47 @@ MAX_ARTIFACT_TEXT = 250_000
 MAX_READ_PER_FILE = 12_000
 MAX_ARCHIVE_FILES = 256
 MAX_ARCHIVE_EXPANDED = 16_000_000
+MAX_INSPECT_JSON = 1_000_000
+MAX_REGEX_PATTERN = 300
+MAX_REGEX_LINE = 4_096
+
+
+def _compile_safe_regex(pattern: str, flags: int = 0) -> re.Pattern[str]:
+    """Reject constructs with disproportionate worst-case backtracking."""
+
+    if len(pattern) > MAX_REGEX_PATTERN:
+        raise ValueError(f"regex exceeds {MAX_REGEX_PATTERN}-character limit")
+    if re.search(r"\\[1-9]|\(\?(?:[=!]|<[=!])", pattern):
+        raise ValueError("regex backreferences and lookarounds are not supported")
+    if re.search(r"\((?:\\.|[^()])*[+*}](?:\\.|[^()])*\)[+*{]", pattern):
+        raise ValueError("regex contains a nested quantified expression")
+    if re.search(r"\((?:\\.|[^()])*\|(?:\\.|[^()])*\)[+*{]", pattern):
+        raise ValueError("regex contains a quantified alternation")
+    if re.search(r"(?:\.\*){2,}|(?:\.\+){2,}", pattern):
+        raise ValueError("regex contains repeated unbounded wildcards")
+    return re.compile(pattern, flags)
+
+
+def python_resource_prelude(timeout: int) -> str:
+    """Return portable best-effort resource limits for untrusted helper code."""
+
+    cpu_seconds = max(2, timeout + 1)
+    return (
+        "try:\n"
+        " import resource\n"
+        " def _limit(kind, value):\n"
+        "  soft, hard = resource.getrlimit(kind)\n"
+        "  ceiling = value if hard < 0 else min(value, hard)\n"
+        "  resource.setrlimit(kind, (ceiling, ceiling))\n"
+        f" _limit(resource.RLIMIT_CPU, {cpu_seconds})\n"
+        " _limit(resource.RLIMIT_AS, 1610612736)\n"
+        " _limit(resource.RLIMIT_FSIZE, 33554432)\n"
+        " _limit(resource.RLIMIT_NOFILE, 64)\n"
+        " if hasattr(resource, 'RLIMIT_NPROC'):\n"
+        "  _limit(resource.RLIMIT_NPROC, 64)\n"
+        "except (ImportError, OSError, ValueError):\n"
+        " pass\n"
+    )
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -74,8 +116,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "read_file",
         "description": (
             "Read one small targeted window from a task file. Never returns a "
-            "whole large document. Inspect or search first. The window is stored "
-            "as an artifact for exact answer extraction."
+            "whole large document. Offset and limit are byte counts. Inspect or "
+            "search first. The window is stored as an artifact for exact answer "
+            "extraction."
         ),
         "input_schema": {
             "type": "object",
@@ -257,15 +300,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "extraction_regex": {
                     "type": "string",
                     "description": (
-                        "Regex applied to the artifact. The selected group becomes "
-                        "the answer. Omit to use the whole stripped artifact."
+                        "Regex applied to the artifact. By default the full match "
+                        "(group 0) becomes the answer; set regex_group only when "
+                        "the answer is in a capture group. Omit the regex to use "
+                        "the whole stripped artifact."
                     ),
                 },
                 "regex_group": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 20,
-                    "default": 1,
+                    "default": 0,
                 },
                 "answer": {"type": "string", "maxLength": 20000},
                 "verification_artifact_id": {
@@ -351,6 +396,17 @@ class TaskToolRuntime:
         self._python_producers: dict[str, str] = {}
         self._read_totals: dict[str, int] = {}
         self.cancellation = cancellation or CancellationToken()
+
+    def begin_attempt(self, cancellation: CancellationToken) -> None:
+        """Reuse artifacts and sessions while resetting attempt-local output."""
+
+        self.cancellation = cancellation
+        self.recorded_answer = None
+
+    def close(self) -> None:
+        for session in self.sessions.values():
+            session.close()
+        self.sessions.clear()
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
         self.cancellation.check()
@@ -568,52 +624,89 @@ class TaskToolRuntime:
         if suffix in {".csv", ".tsv"}:
             return self._inspect_delimited(path, file_path, suffix)
 
-        raw = file_path.read_bytes()
+        size = file_path.stat().st_size
+        with file_path.open("rb") as file:
+            prefix = file.read(4_096)
         self.cancellation.check()
-        base: dict[str, Any] = {"path": path, "bytes": len(raw), "suffix": suffix}
-        if b"\x00" in raw[:4096]:
+        base: dict[str, Any] = {"path": path, "bytes": size, "suffix": suffix}
+        if b"\x00" in prefix:
             return {
                 **base,
                 "kind": "binary",
-                "magic_hex": raw[:64].hex(" "),
+                "magic_hex": prefix[:64].hex(" "),
             }
 
-        text = raw.decode("utf-8", errors="replace")
         if suffix in {".json", ".jsonl"}:
             try:
                 if suffix == ".jsonl":
-                    lines = [line for line in text.splitlines() if line.strip()]
-                    sample_values = [json.loads(line) for line in lines[:3]]
+                    line_count = 0
+                    sample_values = []
+                    with file_path.open(
+                        "r", encoding="utf-8", errors="replace"
+                    ) as file:
+                        for line, _counts, truncated in self._bounded_text_lines(file):
+                            if not line.strip():
+                                continue
+                            if truncated:
+                                raise ValueError(
+                                    "JSONL line exceeds compact inspection limit"
+                                )
+                            line_count += 1
+                            if len(sample_values) < 3:
+                                sample_values.append(json.loads(line))
+                            if line_count % 500 == 0:
+                                self.cancellation.check()
                     return {
                         **base,
                         "kind": "jsonl",
-                        "line_count": len(lines),
+                        "line_count": line_count,
                         "sample_shapes": [
                             self._json_shape(value) for value in sample_values
                         ],
                     }
-                parsed = json.loads(text)
-                return {
-                    **base,
-                    "kind": "json",
-                    "shape": self._json_shape(parsed),
-                    "sample": self._json_sample(parsed),
-                }
+                if size > MAX_INSPECT_JSON:
+                    base["parse_error"] = (
+                        "JSON exceeds compact structural-parse limit; "
+                        "summarized as text"
+                    )
+                else:
+                    with file_path.open(
+                        "r", encoding="utf-8", errors="replace"
+                    ) as file:
+                        parsed = json.load(file)
+                    return {
+                        **base,
+                        "kind": "json",
+                        "shape": self._json_shape(parsed),
+                        "sample": self._json_sample(parsed),
+                    }
             except (json.JSONDecodeError, ValueError):
                 base["parse_error"] = "invalid JSON; summarized as text"
 
-        lines = text.splitlines()
-        upper = raw.upper()
+        head: list[str] = []
+        tail: deque[str] = deque(maxlen=4)
+        line_count = 0
+        level_counts = {"error": 0, "warning": 0, "info": 0}
+        with file_path.open("r", encoding="utf-8", errors="replace") as file:
+            for line, counts, _truncated in self._bounded_text_lines(file):
+                line_count += 1
+                clean = line.rstrip("\r\n")
+                if len(head) < 4:
+                    head.append(clean[:500])
+                tail.append(clean[:500])
+                for key, value in counts.items():
+                    level_counts[key] += value
+                if line_count % 500 == 0:
+                    self.cancellation.check()
         return {
             **base,
             "kind": "text",
-            "line_count": len(lines),
-            "level_counts": {
-                "error": upper.count(b"ERROR"),
-                "warning": upper.count(b"WARN"),
-                "info": upper.count(b"INFO"),
+            "line_count": line_count,
+            "level_counts": level_counts,
+            "sample": {
+                "head": head,
+                "tail": list(tail) if line_count > 4 else [],
             },
-            "sample": self._line_sample(lines),
         }
 
     def _tool_read_file(
@@ -634,22 +727,26 @@ class TaskToolRuntime:
                 "or run_python for targeted analysis"
             )
         limit = max(1, min(limit, MAX_TOOL_SAMPLE, remaining_budget))
-        raw = file_path.read_bytes()
+        with file_path.open("rb") as file:
+            file.seek(offset)
+            raw = file.read(limit)
         if mode == "hex":
-            limit = min(limit, MAX_TOOL_SAMPLE // 3)
-            content = raw[offset : offset + limit].hex(" ")
+            raw = raw[: MAX_TOOL_SAMPLE // 3]
+            content = raw.hex(" ")
         else:
-            content = raw.decode("utf-8", errors="replace")[offset : offset + limit]
-        self._read_totals[path] = used + len(content)
+            content = raw.decode("utf-8", errors="replace")
+        self._read_totals[path] = used + len(raw)
         artifact_id = self.artifacts.put(content)
+        file_size = file_path.stat().st_size
         return {
             "path": path,
             "artifact_id": artifact_id,
             "sample": content,
             "offset": offset,
             "returned_chars": len(content),
+            "returned_bytes": len(raw),
             "remaining_read_budget": MAX_READ_PER_FILE - self._read_totals[path],
-            "truncated": offset + limit < len(raw),
+            "truncated": offset + len(raw) < file_size,
             "instruction": "Use search_files for more targeted context.",
         }
 
@@ -662,21 +759,25 @@ class TaskToolRuntime:
     ) -> dict[str, Any]:
         max_matches = max(1, min(max_matches, 40))
         flags = re.IGNORECASE if ignore_case else 0
-        regex = re.compile(pattern, flags)
+        regex = _compile_safe_regex(pattern, flags)
         matches: list[str] = []
         for path in sorted(self.root.glob(glob)):
             self.cancellation.check()
             if not path.is_file() or path.stat().st_size > 8_000_000:
                 continue
-            text = path.read_text("utf-8", errors="replace")
             relative = path.relative_to(self.root)
-            for line_number, line in enumerate(text.splitlines(), start=1):
-                if line_number % 250 == 0:
-                    self.cancellation.check()
-                if regex.search(line):
-                    matches.append(f"{relative}:{line_number}:{line[:300]}")
-                    if len(matches) >= max_matches:
-                        break
+            with path.open("r", encoding="utf-8", errors="replace") as file:
+                for line_number, (line, _counts, _truncated) in enumerate(
+                    self._bounded_text_lines(file), start=1
+                ):
+                    if line_number % 250 == 0:
+                        self.cancellation.check()
+                    if regex.search(line):
+                        matches.append(
+                            f"{relative}:{line_number}:{line[:300].rstrip()}"
+                        )
+                        if len(matches) >= max_matches:
+                            break
             if len(matches) >= max_matches:
                 break
         content = "\n".join(matches)
@@ -687,6 +788,32 @@ class TaskToolRuntime:
             "truncated": len(matches) >= max_matches,
         }
 
+    def _bounded_text_lines(self, file: Any):
+        """Yield bounded physical lines while draining oversized lines safely."""
+
+        while True:
+            first = file.readline(MAX_REGEX_LINE)
+            if not first:
+                return
+            upper = first.upper()
+            counts = {
+                "error": upper.count("ERROR"),
+                "warning": upper.count("WARN"),
+                "info": upper.count("INFO"),
+            }
+            truncated = not first.endswith(("\n", "\r"))
+            while truncated:
+                chunk = file.readline(MAX_REGEX_LINE)
+                if not chunk:
+                    break
+                upper = chunk.upper()
+                counts["error"] += upper.count("ERROR")
+                counts["warning"] += upper.count("WARN")
+                counts["info"] += upper.count("INFO")
+                truncated = not chunk.endswith(("\n", "\r"))
+                self.cancellation.check()
+            yield first, counts, len(first) >= MAX_REGEX_LINE
+
     def _tool_search_artifact(
         self,
         artifact_id: str,
@@ -696,7 +823,9 @@ class TaskToolRuntime:
         context_chars: int = 100,
     ) -> dict[str, Any]:
         source = self.artifacts.get(artifact_id)
-        regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+        regex = _compile_safe_regex(
+            pattern, re.IGNORECASE if ignore_case else 0
+        )
         max_matches = max(1, min(max_matches, 30))
         context_chars = max(0, min(context_chars, 300))
         matches: list[dict[str, Any]] = []
@@ -735,7 +864,8 @@ class TaskToolRuntime:
         }
         # Keep the host interpreter isolated while allowing extracted challenge
         # packages to be imported from this task's workspace.
-        wrapped_code = (
+        bounded_timeout = max(1, min(timeout, 60))
+        wrapped_code = python_resource_prelude(bounded_timeout) + (
             "import sys\n"
             f"sys.path.insert(0, {str(self.root)!r})\n"
             f"{code}"
@@ -752,7 +882,7 @@ class TaskToolRuntime:
                 stderr=stderr_file,
                 start_new_session=True,
             )
-            deadline = time.monotonic() + max(1, min(timeout, 60))
+            deadline = time.monotonic() + bounded_timeout
             timed_out = False
             while True:
                 if self.cancellation.cancelled:
@@ -770,6 +900,7 @@ class TaskToolRuntime:
                     break
                 except subprocess.TimeoutExpired:
                     continue
+            self._kill_process_tree(process)
 
             self.cancellation.check()
             stdout_file.seek(0)
@@ -805,8 +936,6 @@ class TaskToolRuntime:
 
     @staticmethod
     def _kill_process_tree(process: subprocess.Popen[str]) -> None:
-        if process.poll() is not None:
-            return
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -836,7 +965,10 @@ class TaskToolRuntime:
         timeout: int = 20,
     ) -> dict[str, Any]:
         target = self._safe_url(url)
-        client = self.sessions.setdefault(session, requests.Session())
+        client = self.sessions.get(session)
+        if client is None:
+            client = requests.Session()
+            self.sessions[session] = client
         response = client.request(
             method=method,
             url=target,
@@ -851,6 +983,8 @@ class TaskToolRuntime:
         chunks: list[bytes] = []
         body_bytes = 0
         truncated = False
+        close_callback = response.close
+        self.cancellation.add_callback(close_callback)
         try:
             for chunk in response.iter_content(chunk_size=8192):
                 self.cancellation.check()
@@ -867,6 +1001,7 @@ class TaskToolRuntime:
                     truncated = True
                     break
         finally:
+            self.cancellation.remove_callback(close_callback)
             response.close()
         encoding = response.encoding or "utf-8"
         body = b"".join(chunks).decode(encoding, errors="replace")
@@ -876,7 +1011,16 @@ class TaskToolRuntime:
             key: value
             for key, value in response.headers.items()
             if key.lower()
-            in {"content-type", "location", "set-cookie", "www-authenticate"}
+            in {
+                "content-type",
+                "link",
+                "location",
+                "refresh",
+                "set-cookie",
+                "www-authenticate",
+                "x-next",
+                "x-next-url",
+            }
         }
         return {
             "status": response.status_code,
@@ -1114,7 +1258,7 @@ class TaskToolRuntime:
         evidence: str,
         artifact_id: str | None = None,
         extraction_regex: str | None = None,
-        regex_group: int = 1,
+        regex_group: int = 0,
         answer: str | None = None,
         verification_artifact_id: str | None = None,
     ) -> dict[str, Any]:
@@ -1124,7 +1268,9 @@ class TaskToolRuntime:
         if artifact_id:
             source_text = self.artifacts.get(artifact_id)
             if extraction_regex:
-                match = re.search(extraction_regex, source_text, re.MULTILINE)
+                match = _compile_safe_regex(
+                    extraction_regex, re.MULTILINE
+                ).search(source_text)
                 if not match:
                     raise ValueError("extraction_regex did not match the artifact")
                 try:

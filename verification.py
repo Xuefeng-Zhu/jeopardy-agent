@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import json
-import math
 from decimal import Decimal, InvalidOperation
 
 from agent_types import Candidate, Verification
@@ -27,6 +26,8 @@ class CandidateVerifier:
             return Verification(False, "empty answer")
         if len(answer) > 20_000:
             return Verification(False, "answer exceeds 20,000 characters")
+        if not math_isfinite(candidate.confidence):
+            return Verification(False, "confidence is not finite")
         if candidate.confidence < self.minimum_confidence:
             return Verification(
                 False,
@@ -56,7 +57,7 @@ class CandidateVerifier:
                 parsed = Decimal(number)
             except InvalidOperation:
                 return Verification(False, f"not a numeric answer: {answer!r}")
-            if not math.isfinite(float(parsed)):
+            if not parsed.is_finite():
                 return Verification(False, "numeric answer is not finite")
         elif fmt == "literal":
             try:
@@ -83,3 +84,12 @@ class CandidateVerifier:
                 )
 
         return Verification(True, f"{fmt} structure and evidence checks passed")
+
+
+def math_isfinite(value: float) -> bool:
+    """Avoid accepting NaN confidence while tolerating numeric-like inputs."""
+
+    try:
+        return Decimal(str(value)).is_finite()
+    except (InvalidOperation, ValueError):
+        return False

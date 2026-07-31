@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -18,7 +19,11 @@ from agent_types import (
     TileRecord,
     TileStatus,
 )
-from fast_paths import is_registered_fast_path_title
+from fast_paths import (
+    fast_path_expected_seconds,
+    is_cpu_heavy_fast_path_title,
+    is_registered_fast_path_title,
+)
 from solver import TileSolver
 from verification import CandidateVerifier
 
@@ -43,12 +48,14 @@ class AgentConfig:
     recipe_backoff_seconds: float = 30.0
     board_poll_seconds: float = 2.0
     submit_interval: float = 3.15
+    submission_soft_deadline: float = 15.0
     minimum_confidence: float = 0.82
     candidate_buffer: int = 16
     run_once: bool = False
     dry_run: bool = False
     fast_paths: bool = True
     fast_path_only: bool = False
+    cpu_heavy_workers: int = 1
 
     @classmethod
     def from_env(cls) -> AgentConfig:
@@ -75,6 +82,10 @@ class AgentConfig:
                 0.5, float(os.environ.get("BOARD_POLL_SECONDS", "2"))
             ),
             submit_interval=max(3.05, float(os.environ.get("SUBMIT_INTERVAL", "3.15"))),
+            submission_soft_deadline=max(
+                1.0,
+                float(os.environ.get("SUBMISSION_SOFT_DEADLINE_SECONDS", "15")),
+            ),
             minimum_confidence=min(
                 1.0, max(0.0, float(os.environ.get("MIN_CONFIDENCE", "0.82")))
             ),
@@ -83,6 +94,9 @@ class AgentConfig:
             dry_run=_env_bool("DRY_RUN"),
             fast_paths=_env_bool("FAST_PATHS", default=True),
             fast_path_only=_env_bool("FAST_PATH_ONLY"),
+            cpu_heavy_workers=max(
+                1, int(os.environ.get("CPU_HEAVY_WORKERS", "1"))
+            ),
         )
 
 
@@ -176,6 +190,7 @@ class RecipeGate:
 
 ResultHandler = Callable[[Candidate, dict[str, Any]], Awaitable[None]]
 OpenCheck = Callable[[str], bool]
+ChangeHandler = Callable[[], None]
 
 
 class SubmissionManager:
@@ -186,15 +201,18 @@ class SubmissionManager:
         gate: RecipeGate,
         is_open: OpenCheck,
         on_result: ResultHandler,
+        on_change: ChangeHandler | None = None,
     ) -> None:
         self.game = game
         self.config = config
         self.gate = gate
         self.is_open = is_open
         self.on_result = on_result
+        self.on_change = on_change or (lambda: None)
         self._pending: list[Candidate] = []
         self._condition = asyncio.Condition()
         self._stopping = False
+        self._stop_event = asyncio.Event()
         self._last_submit = 0.0
 
     @property
@@ -207,10 +225,12 @@ class SubmissionManager:
                 return
             self._pending.append(candidate)
             self._condition.notify_all()
+        self.on_change()
 
     async def stop(self, *, discard_pending: bool = True) -> None:
         async with self._condition:
             self._stopping = True
+            self._stop_event.set()
             if discard_pending:
                 self._pending.clear()
             self._condition.notify_all()
@@ -226,10 +246,34 @@ class SubmissionManager:
                 await self.on_result(candidate, {"result": "already_claimed"})
                 await self._notify()
                 continue
+            if not self.gate.is_current(candidate):
+                self.gate.on_neutral(candidate)
+                await self.on_result(candidate, {"result": "invalidated"})
+                await self._notify()
+                continue
 
             wait = self.config.submit_interval - (time.monotonic() - self._last_submit)
             if wait > 0:
-                await asyncio.sleep(wait)
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=wait)
+                except TimeoutError:
+                    pass
+                if self._stopping:
+                    self.gate.on_neutral(candidate)
+                    return
+
+            # A board update can claim or close the tile while it waits for the
+            # single submission lane.
+            if not self.is_open(candidate.task_id):
+                self.gate.on_neutral(candidate)
+                await self.on_result(candidate, {"result": "already_claimed"})
+                await self._notify()
+                continue
+            if not self.gate.is_current(candidate):
+                self.gate.on_neutral(candidate)
+                await self.on_result(candidate, {"result": "invalidated"})
+                await self._notify()
+                continue
 
             try:
                 if self.config.dry_run:
@@ -239,7 +283,9 @@ class SubmissionManager:
                         self.game.submit, candidate.task_id, candidate.answer
                     )
                 self._last_submit = time.monotonic()
-            except Exception as exc:  # noqa: BLE001 - survive transient API faults
+            except Exception as exc:
+                if type(exc).__name__ == "AuthError":
+                    raise
                 self.game.log(
                     f"{candidate.task_id}: submit error {exc!r}; retrying in 5s"
                 )
@@ -284,7 +330,13 @@ class SubmissionManager:
                 now = time.monotonic()
                 ranked = sorted(
                     self._pending,
-                    key=lambda item: (item.priority, -item.created_at),
+                    key=lambda item: (
+                        item.deadline_priority(
+                            now, self.config.submission_soft_deadline
+                        ),
+                        item.priority,
+                        -item.created_at,
+                    ),
                     reverse=True,
                 )
                 selected: Candidate | None = None
@@ -297,6 +349,7 @@ class SubmissionManager:
 
                 if selected is not None:
                     self._pending.remove(selected)
+                    self.on_change()
                     return selected
 
                 if self._stopping and not self._pending:
@@ -319,6 +372,7 @@ class SubmissionManager:
     async def _notify(self) -> None:
         async with self._condition:
             self._condition.notify_all()
+        self.on_change()
 
     @staticmethod
     def _retry_seconds(result: dict[str, Any], default: float) -> float:
@@ -359,12 +413,14 @@ class AgentController:
         self._cancel_tokens: dict[str, CancellationToken] = {}
         self._selected_ids: set[str] | None = None
         self._fatal_error: BaseException | None = None
+        self._wake_event = asyncio.Event()
         self.submitter = SubmissionManager(
             game,
             config,
             self.gate,
             self.is_open,
             self._on_submission_result,
+            self._wake_scheduler,
         )
 
     def is_open(self, task_id: str) -> bool:
@@ -372,38 +428,75 @@ class AgentController:
 
     async def run(self) -> None:
         submit_task = asyncio.create_task(self.submitter.run())
+        submit_task.add_done_callback(lambda _task: self._wake_scheduler())
         first_sync = False
         board_errors = 0
+        next_board_at = 0.0
         try:
             while True:
+                self._wake_event.clear()
                 if self._fatal_error is not None:
                     raise self._fatal_error
-                try:
-                    board = await asyncio.to_thread(self.game.board)
-                    board_errors = 0
-                    self._sync_board(board)
-                    first_sync = True
-                    self._schedule()
-                except Exception as exc:
-                    if type(exc).__name__ == "AuthError":
-                        raise
-                    board_errors += 1
-                    self.game.log(
-                        f"board poll failed ({board_errors}): {exc!r}; continuing"
+                if submit_task.done():
+                    submit_error = submit_task.exception()
+                    if submit_error is not None:
+                        raise submit_error
+                    raise RuntimeError("submission manager stopped unexpectedly")
+                now = time.monotonic()
+                if now >= next_board_at:
+                    try:
+                        board = await asyncio.to_thread(self.game.board)
+                        board_errors = 0
+                        self._sync_board(board)
+                        first_sync = True
+                    except Exception as exc:
+                        if type(exc).__name__ == "AuthError":
+                            raise
+                        board_errors += 1
+                        self.game.log(
+                            f"board poll failed ({board_errors}): {exc!r}; continuing"
+                        )
+                    interval = min(
+                        10.0,
+                        self.config.board_poll_seconds * (1 + board_errors),
                     )
+                    next_board_at = time.monotonic() + interval
+
+                self._schedule()
 
                 if self.config.run_once and first_sync and self._run_once_done():
                     break
-                await asyncio.sleep(
-                    min(10.0, self.config.board_poll_seconds * (1 + board_errors))
-                )
+                wake_at = min(next_board_at, self._next_scheduler_wake())
+                timeout = max(0.01, wake_at - time.monotonic())
+                try:
+                    await asyncio.wait_for(self._wake_event.wait(), timeout=timeout)
+                except TimeoutError:
+                    pass
         finally:
             for token in self._cancel_tokens.values():
                 token.cancel("agent controller is shutting down")
             if self._active:
                 await asyncio.gather(*self._active.values(), return_exceptions=True)
             await self.submitter.stop()
-            await submit_task
+            await asyncio.gather(submit_task, return_exceptions=True)
+            close_solver = getattr(self.solver, "close", None)
+            if callable(close_solver):
+                close_solver()
+
+    def _wake_scheduler(self) -> None:
+        self._wake_event.set()
+
+    def _next_scheduler_wake(self) -> float:
+        now = time.monotonic()
+        wake_times = [
+            record.next_attempt_at
+            for record in self.records.values()
+            if record.status == TileStatus.RETRY and record.next_attempt_at > now
+        ]
+        wake_times.extend(
+            value for value in self._recipe_backoff_until.values() if value > now
+        )
+        return min(wake_times) if wake_times else now + 60.0
 
     def _sync_board(self, board: dict[str, Any]) -> None:
         phase = str(board.get("phase") or "")
@@ -450,6 +543,7 @@ class AgentController:
                     )
                 record.status = TileStatus.CLAIMED
                 record.candidate = None
+                self._discard_task_state(task_id)
 
     def _schedule(self) -> None:
         capacity = self.config.model_workers - len(self._active)
@@ -486,37 +580,52 @@ class AgentController:
     def _select_records(
         self, eligible: list[TileRecord], room: int
     ) -> list[TileRecord]:
-        """Reserve worker capacity for fast tiers and high-value exploration."""
+        """Greedily cover the board lanes most likely to disappear first.
+
+        The board is a race, so fixed family/tier batches are a poor proxy for
+        value: they can spend a whole wave on comfortable cells while a nearly
+        exhausted cell disappears. Selection instead uses marginal coverage.
+        Each added worker is scored against the categories and claim lanes
+        already covered by active work and by earlier picks in this wave.
+        """
 
         if room <= 0:
             return []
-        ranked = sorted(
-            eligible,
-            key=lambda record: (
-                int(is_registered_fast_path_title(record.tile.title)),
-                self._solve_priority(record),
-                record.tile.points,
-            ),
-            reverse=True,
-        )
         busy_recipes = {
             record.tile.recipe_key
             for record in self.records.values()
             if record.status in {TileStatus.SOLVING, TileStatus.CANDIDATE}
         }
+        covered_categories = {
+            record.tile.category
+            for record in self.records.values()
+            if record.status in {TileStatus.SOLVING, TileStatus.CANDIDATE}
+        }
+        covered_recipes = set(busy_recipes)
         selected: list[TileRecord] = []
         selected_recipes: set[str] = set()
-        active_high = sum(
+        active_cpu_heavy = sum(
             1
             for record in self.records.values()
             if record.status in {TileStatus.SOLVING, TileStatus.CANDIDATE}
-            and record.tile.points >= 400
+            and is_cpu_heavy_fast_path_title(record.tile.title)
         )
-        high_limit = max(1, self.config.model_workers // 2)
-        high_slots = max(0, min(room, high_limit - active_high))
         now = time.monotonic()
 
         def can_select(record: TileRecord) -> bool:
+            selected_cpu_heavy = sum(
+                is_cpu_heavy_fast_path_title(item.tile.title)
+                for item in selected
+            )
+            if (
+                is_cpu_heavy_fast_path_title(record.tile.title)
+                and active_cpu_heavy + selected_cpu_heavy
+                >= min(
+                    self.config.model_workers,
+                    self.config.cpu_heavy_workers,
+                )
+            ):
+                return False
             recipe_key = record.tile.recipe_key
             if self._recipe_backoff_until.get(recipe_key, 0.0) > now:
                 return False
@@ -528,40 +637,93 @@ class AgentController:
                 and (recipe_key in busy_recipes or recipe_key in selected_recipes)
             )
 
-        def take(records: list[TileRecord], limit: int) -> None:
-            for record in records:
-                if len(selected) >= room or limit <= 0:
-                    return
-                if record in selected or not can_select(record):
-                    continue
-                selected.append(record)
-                selected_recipes.add(record.tile.recipe_key)
-                limit -= 1
-
-        deterministic = [
-            record
-            for record in ranked
-            if is_registered_fast_path_title(record.tile.title)
-        ]
-        take(deterministic, room)
-
-        selected_high = sum(record.tile.points >= 400 for record in selected)
-        high_slots = max(0, high_slots - selected_high)
-        high = [record for record in ranked if record.tile.points >= 400]
-        lower_tier = [record for record in ranked if record.tile.points < 400]
-        take(high, high_slots)
-        take(lower_tier, room - len(selected))
-        take(ranked, room - len(selected))
+        remaining = list(eligible)
+        while remaining and len(selected) < room:
+            selectable = [record for record in remaining if can_select(record)]
+            if not selectable:
+                break
+            uncovered_categories = [
+                record
+                for record in selectable
+                if record.tile.category not in covered_categories
+            ]
+            uncovered_recipes = [
+                record
+                for record in selectable
+                if record.tile.recipe_key not in covered_recipes
+            ]
+            record = max(
+                uncovered_categories or uncovered_recipes or selectable,
+                key=lambda item: (
+                    self._race_priority(
+                        item, covered_categories, covered_recipes
+                    ),
+                    item.tile.points,
+                    -item.attempts,
+                    item.tile.id,
+                ),
+            )
+            selected.append(record)
+            selected_recipes.add(record.tile.recipe_key)
+            covered_categories.add(record.tile.category)
+            covered_recipes.add(record.tile.recipe_key)
+            remaining.remove(record)
         return selected
 
+    def _race_priority(
+        self,
+        record: TileRecord,
+        covered_categories: set[str],
+        covered_recipes: set[str],
+    ) -> float:
+        """Expected points per second, adjusted for contention and coverage."""
+
+        score = self._solve_priority(record)
+        tile = record.tile
+        if is_registered_fast_path_title(tile.title):
+            score *= 2.0
+            # Unique high tiers disappear first and carried most of the points
+            # missed in Round 1. Preserve expected-yield ordering within a
+            # tier, while ensuring a validated 500 is not displaced by a deep
+            # stack of cheap lower-value siblings.
+            if tile.points >= 500:
+                score *= 2.5
+            elif tile.points >= 400:
+                score *= 1.5
+        if self.replay_cache.has_scheduler_key(tile.recipe_key):
+            score *= 1.5
+        score *= self._claim_pressure(tile)
+        if tile.category not in covered_categories:
+            score *= 2.0
+        if tile.recipe_key not in covered_recipes:
+            score *= 1.25
+        return score
+
+    @staticmethod
+    def _claim_pressure(tile: Tile) -> float:
+        """Estimate urgency from how much of a board cell has disappeared."""
+
+        try:
+            total = int(tile.raw.get("total") or 0)
+            remaining = int(tile.raw.get("remaining") or 0)
+        except (TypeError, ValueError):
+            return 1.0
+        if total <= 0 or remaining <= 0 or remaining > total:
+            return 1.0
+        claimed_fraction = (total - remaining) / total
+        scarcity = 1.0 / remaining
+        return 1.0 + (1.25 * claimed_fraction) + (0.25 * scarcity)
+
     def _solve_priority(self, record: TileRecord) -> float:
-        expected_seconds = {
-            100: 20.0,
-            200: 30.0,
-            300: 50.0,
-            400: 85.0,
-            500: 140.0,
-        }.get(record.tile.points, 90.0)
+        expected_seconds = fast_path_expected_seconds(record.tile.title)
+        if expected_seconds is None:
+            expected_seconds = {
+                100: 20.0,
+                200: 30.0,
+                300: 50.0,
+                400: 85.0,
+                500: 140.0,
+            }.get(record.tile.points, 90.0)
         retry_penalty = 1.0 + (0.25 * record.attempts)
         return (
             record.tile.points
@@ -572,6 +734,7 @@ class AgentController:
     def _worker_done(self, task_id: str) -> None:
         self._active.pop(task_id, None)
         self._cancel_tokens.pop(task_id, None)
+        self._wake_scheduler()
 
     def _replay_allowed(self, generator_fingerprint: str) -> bool:
         return (
@@ -591,25 +754,29 @@ class AgentController:
             family_failure_hint = self._family_failure_hints.get(
                 record.tile.recipe_key, ""
             )
-            if family_failure_hint:
-                candidate = await asyncio.to_thread(
-                    self.solver.solve,
-                    record.tile,
-                    generation,
-                    None,
-                    cancellation,
-                    attempt=record.attempts,
-                    family_failure_hint=family_failure_hint,
-                )
-            else:
-                candidate = await asyncio.to_thread(
-                    self.solver.solve,
-                    record.tile,
-                    generation,
-                    None,
-                    cancellation,
-                    attempt=record.attempts,
-                )
+            solve_kwargs: dict[str, Any] = {"attempt": record.attempts}
+            parameters = inspect.signature(self.solver.solve).parameters.values()
+            accepts_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+            parameter_names = {parameter.name for parameter in parameters}
+            if family_failure_hint and (
+                accepts_kwargs or "family_failure_hint" in parameter_names
+            ):
+                solve_kwargs["family_failure_hint"] = family_failure_hint
+            if record.last_error and (
+                accepts_kwargs or "prior_failure_hint" in parameter_names
+            ):
+                solve_kwargs["prior_failure_hint"] = record.last_error
+            candidate = await asyncio.to_thread(
+                self.solver.solve,
+                record.tile,
+                generation,
+                None,
+                cancellation,
+                **solve_kwargs,
+            )
             cancellation.check()
         except SolveCancelled as exc:
             self.game.log(f"{record.tile.id}: solve cancelled: {exc}")
@@ -622,6 +789,7 @@ class AgentController:
         except Exception as exc:  # noqa: BLE001 - isolate one malformed tile
             if type(exc).__name__ == "AuthError":
                 self._fatal_error = exc
+                self._wake_scheduler()
                 return
             self.game.log(f"{record.tile.id}: solver error {exc!r}")
             self._retry_or_fail(record, str(exc))
@@ -657,22 +825,34 @@ class AgentController:
             )
             return
 
-        verification = self.verifier.verify(candidate)
+        try:
+            verification = self.verifier.verify(candidate)
+        except Exception as exc:  # noqa: BLE001 - a bad verifier must not strand a tile
+            self.game.log(f"{record.tile.id}: verifier error {exc!r}")
+            self._retry_or_fail(record, f"verifier error: {exc}")
+            return
         candidate = candidate.with_verification(
             verification.accepted, verification.note
         )
         if not verification.accepted:
             self.game.log(f"{record.tile.id}: candidate rejected: {verification.note}")
+            if candidate.strategy.startswith("fast:"):
+                self.solver.disable_fast_path(
+                    candidate.recipe_key,
+                    generation,
+                    candidate.strategy.removeprefix("fast:"),
+                )
             self._retry_or_fail(record, verification.note)
             return
 
         record.candidate = candidate
         record.status = TileStatus.CANDIDATE
+        await self.submitter.enqueue(candidate)
         self.game.log(
             f"{record.tile.id}: verified candidate queued "
-            f"confidence={candidate.confidence:.2f} source={candidate.source}"
+            f"confidence={candidate.confidence:.2f} source={candidate.source} "
+            f"pending={self.submitter.pending_count}"
         )
-        await self.submitter.enqueue(candidate)
 
     def _defer_recipe_after_exhaustion(self, record: TileRecord) -> float:
         """Avoid spending adjacent workers on the same recently exhausted family."""
@@ -707,6 +887,7 @@ class AgentController:
         record.candidate = None
         if terminal:
             record.status = TileStatus.FAILED
+            self._discard_task_state(record.tile.id)
             self.game.log(f"{record.tile.id}: terminal solve outcome: {reason}")
             return
         attempt_limit = self.config.max_attempts + record.recoveries
@@ -719,10 +900,12 @@ class AgentController:
                 )
                 self.game.log(
                     f"{record.tile.id}: deferred for recovery attempt "
-                    f"{record.recoveries}/{self.config.recovery_attempts}: {reason}"
+                    f"{record.recoveries}/{self.config.recovery_attempts} "
+                    f"retry_in={max(60.0, delay or 0.0):.1f}s: {reason}"
                 )
                 return
             record.status = TileStatus.FAILED
+            self._discard_task_state(record.tile.id)
             self.game.log(
                 f"{record.tile.id}: failed after {record.attempts} attempts: {reason}"
             )
@@ -734,6 +917,10 @@ class AgentController:
             else min(60.0, 5.0 * (2 ** max(0, record.attempts - 1)))
         )
         record.next_attempt_at = time.monotonic() + retry_delay
+        self.game.log(
+            f"{record.tile.id}: retry scheduled attempt={record.attempts + 1} "
+            f"retry_in={retry_delay:.1f}s reason={reason}"
+        )
 
     async def _on_submission_result(
         self, candidate: Candidate, result: dict[str, Any]
@@ -766,16 +953,19 @@ class AgentController:
             record.status = TileStatus.SOLVED
             record.candidate = None
             self.open_ids.discard(candidate.task_id)
+            self._discard_task_state(candidate.task_id)
             return
         if outcome in {"already_claimed", "voided", "unknown_task"}:
             record.status = TileStatus.CLAIMED
             record.candidate = None
             self.open_ids.discard(candidate.task_id)
+            self._discard_task_state(candidate.task_id)
             return
         if outcome == "dry_run":
             record.status = TileStatus.SOLVED
             record.candidate = None
             self.open_ids.discard(candidate.task_id)
+            self._discard_task_state(candidate.task_id)
             return
         if outcome == "incorrect":
             self._family_failure_hints[candidate.recipe_key] = (
@@ -810,9 +1000,15 @@ class AgentController:
         if outcome == "forbidden":
             record.status = TileStatus.FAILED
             record.last_error = "scored submissions must come from the hosted agent"
+            self._discard_task_state(candidate.task_id)
             return
 
         self._retry_or_fail(record, f"submission result {outcome or result!r}")
+
+    def _discard_task_state(self, task_id: str) -> None:
+        discard = getattr(self.solver, "discard_task_state", None)
+        if callable(discard):
+            discard(task_id)
 
     def _run_once_done(self) -> bool:
         if self._active or self.submitter.pending_count:

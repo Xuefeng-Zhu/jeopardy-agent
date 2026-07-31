@@ -18,6 +18,7 @@ import pathlib
 import tempfile
 import time
 from threading import Lock
+from typing import Any
 
 import requests
 
@@ -31,6 +32,8 @@ if not BASE or not KEY:
 _s = requests.Session()
 _s.headers["X-Api-Key"] = KEY
 _log_lock = Lock()
+_download_lock = Lock()
+_completed_downloads: dict[pathlib.Path, tuple[int, int]] = {}
 
 
 # ---------------------------------------------------------------- errors
@@ -195,15 +198,42 @@ def open_tiles(b: dict | None = None) -> list[dict]:
     return sorted(out, key=lambda t: -t.get("points", 0))
 
 
-def task(task_id: str) -> dict:
+def _check_cancel(cancellation: Any | None) -> None:
+    if cancellation is not None:
+        cancellation.check()
+
+
+def _register_close(cancellation: Any | None, response: Any):
+    if cancellation is not None and hasattr(cancellation, "add_callback"):
+        cancellation.add_callback(response.close)
+        return response.close
+    return None
+
+
+def task(task_id: str, cancellation: Any | None = None) -> dict:
     """Prompt, file list, points, and `answer_format` (how the checker
     compares your answer — worth telling your model).
 
     Raises TileUnavailable if the row is still locked or the board isn't live
     yet; that is a game state, so catch it and pick another tile.
     """
-    return _json(_s.get(f"{BASE}/api/task/{task_id}", timeout=30),
-                 f"GET /api/task/{task_id}", unavailable=(403, 404))
+    _check_cancel(cancellation)
+    response = _s.get(
+        f"{BASE}/api/task/{task_id}",
+        timeout=(5, 10),
+        stream=True,
+    )
+    close_callback = _register_close(cancellation, response)
+    try:
+        result = _json(
+            response, f"GET /api/task/{task_id}", unavailable=(403, 404)
+        )
+        _check_cancel(cancellation)
+        return result
+    finally:
+        if close_callback is not None:
+            cancellation.remove_callback(close_callback)
+        response.close()
 
 
 def workdir(task_id: str) -> pathlib.Path:
@@ -221,7 +251,8 @@ def workdir(task_id: str) -> pathlib.Path:
 
 
 def fetch_files(task_id: str, detail: dict,
-                dest: str | pathlib.Path | None = None) -> list[str]:
+                dest: str | pathlib.Path | None = None,
+                cancellation: Any | None = None) -> list[str]:
     """Download a task's files. Returns the filenames.
 
     Defaults to `workdir(task_id)` and SKIPS anything already downloaded: your
@@ -233,15 +264,84 @@ def fetch_files(task_id: str, detail: dict,
     out.mkdir(parents=True, exist_ok=True)
     names = []
     for name in detail.get("files", []):
+        _check_cancel(cancellation)
         path = out / name
-        if not path.exists() or path.stat().st_size == 0:
-            r = _s.get(f"{BASE}/api/task/{task_id}/file/{name}", timeout=120)
-            # Checked, because r.content on an error is a JSON error blob —
-            # unchecked, this wrote `{"detail": "Invalid API key"}` to disk as
-            # your 4 MB log file and let the model "solve" that instead.
-            _raise_for(r, f"GET /api/task/{task_id}/file/{name}",
-                       unavailable=(403, 404))
-            path.write_bytes(r.content)
+        with _download_lock:
+            expected_stat = _completed_downloads.get(path)
+        try:
+            current_stat = path.stat()
+        except OSError:
+            current_stat = None
+        complete = (
+            expected_stat is not None
+            and current_stat is not None
+            and expected_stat
+            == (current_stat.st_size, current_stat.st_mtime_ns)
+        )
+        if not complete:
+            r = _s.get(
+                f"{BASE}/api/task/{task_id}/file/{name}",
+                timeout=(5, 10),
+                stream=True,
+                headers={"Accept-Encoding": "identity"},
+            )
+            close_callback = _register_close(cancellation, r)
+            temporary: pathlib.Path | None = None
+            try:
+                # Checked, because an error body is a JSON blob rather than a
+                # challenge file.
+                _raise_for(
+                    r,
+                    f"GET /api/task/{task_id}/file/{name}",
+                    unavailable=(403, 404),
+                )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    dir=path.parent, prefix=f".{path.name}.", delete=False
+                ) as writer:
+                    temporary = pathlib.Path(writer.name)
+                    downloaded = 0
+                    for chunk in r.iter_content(chunk_size=65_536):
+                        _check_cancel(cancellation)
+                        if not chunk:
+                            continue
+                        writer.write(chunk)
+                        downloaded += len(chunk)
+                expected = r.headers.get("content-length")
+                content_encoding = (
+                    r.headers.get("content-encoding") or "identity"
+                ).strip().lower()
+                # requests.iter_content() transparently decodes gzip/br bodies,
+                # while Content-Length still describes the encoded wire bytes.
+                # Enforce the header only when it describes the bytes written.
+                if (
+                    expected is not None
+                    and content_encoding in {"", "identity"}
+                    and downloaded != int(expected)
+                ):
+                    raise JeopardyError(
+                        f"GET /api/task/{task_id}/file/{name}: expected "
+                        f"{expected} bytes, downloaded {downloaded}"
+                    )
+                if downloaded == 0:
+                    raise JeopardyError(
+                        f"GET /api/task/{task_id}/file/{name}: empty download"
+                    )
+                _check_cancel(cancellation)
+                os.replace(temporary, path)
+                temporary = None
+                completed_stat = path.stat()
+                with _download_lock:
+                    _completed_downloads[path] = (
+                        completed_stat.st_size,
+                        completed_stat.st_mtime_ns,
+                    )
+            finally:
+                if close_callback is not None:
+                    cancellation.remove_callback(close_callback)
+                r.close()
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
         names.append(name)
     return names
 
