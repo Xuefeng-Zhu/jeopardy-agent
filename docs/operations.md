@@ -44,8 +44,9 @@ Expected behavior:
 
 This run can consume model budget and execute model-proposed Python. Use a
 disposable environment. To exclude model calls while retaining live event
-reads, add `FAST_PATH_ONLY=1`; unmatched or inconclusive deterministic tasks
-then become terminal immediately.
+reads, add `FAST_PATH_ONLY=1`. An eligible, compatible cached recipe may still
+solve before handler dispatch if the solver/cache is reused; otherwise
+unmatched or inconclusive handler outcomes become terminal immediately.
 
 ### Focus one or more tasks
 

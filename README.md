@@ -126,7 +126,10 @@ RUN_ONCE=1 MAX_TILES=3 FAST_PATH_ONLY=1 DRY_RUN=1 VERBOSE=1 \
 
 This mode avoids model calls and answer submission. It still authenticates to
 the live event, downloads untrusted task material, makes task-required
-event-host requests, and may run deterministic subprocesses.
+event-host requests, and may run deterministic subprocesses. Eligible,
+compatible cached recipes are replayed before deterministic handlers. A normal
+CLI process starts with an empty replay cache; callers that reuse a populated
+solver/cache can observe replay even with fast-path-only mode enabled.
 
 To exercise the model fallback without submitting:
 
@@ -149,7 +152,7 @@ RUN_ONCE=1 MAX_TILES=3 DRY_RUN=1 VERBOSE=1 \
 | Defaults | Yes | When needed | Yes | Follows phase changes indefinitely |
 | `RUN_ONCE=1 MAX_TILES=3` | Yes | When needed | **Yes** | Exits after the frozen three-tile workload is terminal |
 | Add `DRY_RUN=1` | Yes | When needed | No | Marks verified candidates as dry-run outcomes |
-| Add `FAST_PATH_ONLY=1 DRY_RUN=1` | Yes | No | No | Deterministic hits and misses become terminal |
+| Add `FAST_PATH_ONLY=1 DRY_RUN=1` | Yes | No | No | Allows eligible replay, then deterministic dispatch; handler misses stop without model fallback |
 | Add `TASK_FILTER=A,B` | Yes | Depends on other flags | Depends on `DRY_RUN` | Considers only currently open exact IDs |
 
 ```bash
@@ -162,7 +165,7 @@ RUN_ONCE=1 MAX_TILES=3 python main.py
 # Work only selected open tile IDs
 RUN_ONCE=1 TASK_FILTER=PR-W5,PR-C5 python main.py
 
-# Exercise deterministic handlers without model calls or submissions
+# Calibrate deterministic handlers in a fresh process without model calls or submissions
 RUN_ONCE=1 MAX_TILES=3 FAST_PATH_ONLY=1 DRY_RUN=1 python main.py
 ```
 
@@ -170,7 +173,9 @@ RUN_ONCE=1 MAX_TILES=3 FAST_PATH_ONLY=1 DRY_RUN=1 python main.py
 it can submit answers. `MAX_TILES` freezes the first selected IDs from the
 initial richest-first board view rather than continuously refilling with new
 IDs. See [Deterministic solvers](docs/deterministic-solvers.md) for registered
-handlers and fast-path failure behavior.
+handlers and fast-path failure behavior. `FAST_PATHS` and `FAST_PATH_ONLY`
+control handler dispatch and model fallback after the earlier recipe-replay
+step; neither flag bypasses replay.
 
 Configuration is environment-based. Defaults, bounds, and operational effects
 are documented in [Configuration](docs/configuration.md).

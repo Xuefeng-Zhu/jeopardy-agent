@@ -32,7 +32,7 @@ Use HTTPS. An HTTP base URL would expose the team credential in transit.
 | `DRY_RUN` | false | boolean | Solve and verify but return `dry_run` without calling submit |
 | `MODEL_WORKERS` | `4` | minimum `1` | Maximum concurrent tile workers |
 | `MAX_TURNS` | `12` | minimum `2` | Upper model-turn budget; lower tiers may receive fewer turns |
-| `MAX_MODEL_TOKENS` | `1800` | clamped `256..4096` | Response-token cap per normal model call; finalization is additionally capped at `768` |
+| `MAX_MODEL_TOKENS` | `1800` | solver-clamped `256..4096` | Response-token cap per normal model call; finalization is additionally capped at `768` |
 | `MAX_ATTEMPTS` | `3` | minimum `1` | Normal attempts before a tile stops retrying |
 | `RECOVERY_ATTEMPTS` | `1` | minimum `0` | Deferred attempts allowed after no-candidate exhaustion |
 | `RECIPE_BACKOFF_SECONDS` | `30` | minimum `5` | Family cooldown after solver exhaustion |
@@ -42,13 +42,16 @@ Use HTTPS. An HTTP base URL would expose the team credential in transit.
 | `MIN_CONFIDENCE` | `0.82` | clamped `0..1` | Candidate confidence threshold |
 | `CANDIDATE_BUFFER` | `16` | minimum `1` | Pause new work when verified submissions back up |
 | `CPU_HEAVY_WORKERS` | `1` | minimum `1` | Maximum concurrent CPU-heavy deterministic handlers |
-| `FAST_PATHS` | true | boolean | Attempt deterministic handlers before the model |
-| `FAST_PATH_ONLY` | false | boolean | Force deterministic dispatch, skip the model, and make deterministic misses terminal |
+| `FAST_PATHS` | true | boolean | Attempt deterministic handlers after eligible recipe replay |
+| `FAST_PATH_ONLY` | false | boolean | Force handler dispatch after replay, skip model fallback, and make handler misses terminal |
 
-Invalid numeric strings raise during startup. Bounds prevent unsafe low values
-but do not prevent an operationally poor high value. Increase concurrency only
-after measuring model throttling, CPU pressure, queue delay, and claimed-tile
-rate.
+Invalid numeric strings raise during startup. `AgentConfig.from_env()` applies
+the `256` minimum while reading `MAX_MODEL_TOKENS`; `TileSolver` applies the
+final `256..4096` clamp when it is constructed. Normal model requests use that
+normalized value; a restricted finalization request uses the smaller of that
+value and `768`. Other lower bounds do not prevent operationally poor high
+values. Increase concurrency only after measuring model throttling, CPU
+pressure, queue delay, and claimed-tile rate.
 
 ## Effective behavior and interactions
 
@@ -82,11 +85,19 @@ tokens. It does not perform more investigation.
 
 ### Fast-path controls
 
-- `FAST_PATHS=0` skips deterministic dispatch and sends eligible tasks to the
-  model.
-- `FAST_PATH_ONLY=1` enables deterministic dispatch even if `FAST_PATHS=0`.
-- In fast-path-only mode, both `not_applicable` and `inconclusive` outcomes are
-  terminal for the tile; they do not use normal retries or deferred recovery.
+- Recipe replay is evaluated before either fast-path flag. An eligible,
+  compatible cached recipe can return a candidate when `FAST_PATHS=0` or
+  `FAST_PATH_ONLY=1`.
+- `FAST_PATHS=0` skips deterministic handler dispatch after replay. If no
+  replay succeeds and `FAST_PATH_ONLY=0`, the task proceeds to the model.
+- `FAST_PATH_ONLY=1` enables handler dispatch even if `FAST_PATHS=0`. If
+  neither replay nor a handler solves the task, the model is skipped.
+- After replay, both `not_applicable` and `inconclusive` handler outcomes are
+  terminal in fast-path-only mode; they do not use normal retries or deferred
+  recovery.
+- The flags do not guarantee model-only or handler-only behavior when an
+  eligible replay is already cached. To isolate handlers, start a fresh CLI
+  process with `FAST_PATH_ONLY=1` or run the handler's offline tests directly.
 - `CPU_HEAVY_WORKERS` applies to the five titles listed in
   [Deterministic solvers](deterministic-solvers.md#heavy-compute), within the
   overall `MODEL_WORKERS` cap. Effective CPU-heavy concurrency cannot exceed
@@ -121,7 +132,7 @@ export RECOVERY_ATTEMPTS=0
 This is bounded but not offline. It may call the model proxy and run
 model-proposed Python.
 
-### Deterministic calibration
+### Fresh no-model handler calibration
 
 ```bash
 export RUN_ONCE=1
@@ -130,9 +141,12 @@ export DRY_RUN=1
 export FAST_PATH_ONLY=1
 ```
 
-This profile guarantees that the solver does not construct a model fallback
-for unmatched tasks. It still reads the live board, tasks, files, and
-task-required event-host web pages.
+This fresh CLI profile guarantees that the solver does not construct a model
+fallback. Its replay cache starts empty, and the no-model run cannot create new
+replay recipes, so selected tasks exercise deterministic dispatch. A caller
+that instead reuses a populated solver/cache can still replay an eligible,
+compatible recipe before handler dispatch. Both cases still read the live
+board, tasks, files, and task-required event-host web pages.
 
 ### Hosted long-running process
 

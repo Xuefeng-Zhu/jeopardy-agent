@@ -120,8 +120,8 @@ state when a task's prescribed flow uses forms or other non-GET methods.
 
 ## Calibration and failure behavior
 
-Use deterministic-only mode to measure handler coverage without model calls or
-answer submission:
+Use a fresh no-model CLI run to measure deterministic-handler coverage without
+model calls or answer submission:
 
 ```bash
 RUN_ONCE=1 MAX_TILES=10 FAST_PATH_ONLY=1 DRY_RUN=1 python main.py
@@ -131,10 +131,18 @@ This is still a live event run: it fetches the board, task metadata, files, and
 event-host web pages. Run it only in the hosted container or another disposable
 least-privilege environment.
 
-With `FAST_PATH_ONLY=1`, a `not_applicable` or `inconclusive` result is terminal
-for that tile; it does not consume normal retries or deferred recovery. With the
-default `FAST_PATH_ONLY=0`, the same result falls through to the bounded Claude
-tool loop.
+Eligible, compatible recipe replay runs before deterministic dispatch
+regardless of `FAST_PATHS` or `FAST_PATH_ONLY`. A fresh CLI process starts with
+an empty in-memory cache, and this no-model profile cannot create new replay
+recipes. A caller that reuses a populated solver/cache can still replay when
+the phase gate permits it. To measure a specific handler without replay, start
+a fresh process with one `TASK_FILTER` target or invoke its targeted offline
+tests directly.
+
+With `FAST_PATH_ONLY=1`, a handler `not_applicable` or `inconclusive` result
+after replay is terminal for that tile; it does not consume normal retries or
+deferred recovery. With the default `FAST_PATH_ONLY=0`, the same result falls
+through to the bounded Claude tool loop.
 
 When adding or broadening a handler, follow the regression requirements in
 [Contributing](../CONTRIBUTING.md#deterministic-handler-checklist). A positive

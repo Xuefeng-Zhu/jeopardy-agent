@@ -83,7 +83,11 @@ The solver attempts strategies in this order:
 |---|---|---|---|
 | Recipe replay | Exact versioned generator fingerprint and answer format; practice or an in-memory prior replay validation for scored phases | Python exits zero and the exact extraction repeats identically; answer and rerun evidence use separate artifacts | Discard the fingerprint recipe and continue |
 | Deterministic fast path | Enabled handler matches title, category, format, prompt markers, files, and handler-specific invariants | Answer artifact plus a separate handler-verification artifact | `not_applicable` or `inconclusive` falls through to Claude; it is terminal under `FAST_PATH_ONLY=1` |
-| Claude tool loop | Fast paths are disabled or did not solve, and `FAST_PATH_ONLY=0` | `record_answer` supplies evidence and either an artifact extraction or a direct model value | Retry, deferred recovery, or terminal failure according to the configured attempt budget |
+| Claude tool loop | Neither replay nor an enabled fast path solved, and `FAST_PATH_ONLY=0` | `record_answer` supplies evidence and either an artifact extraction or a direct model value | Retry, deferred recovery, or terminal failure according to the configured attempt budget |
+
+The fast-path flags apply after recipe replay: `FAST_PATHS` controls step 2,
+while `FAST_PATH_ONLY` enables step 2 and prevents step 3. Neither flag skips
+or forces step 1.
 
 See [Deterministic solvers](deterministic-solvers.md) for the current handler
 inventory and recognition contract.
