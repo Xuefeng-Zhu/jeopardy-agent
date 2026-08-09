@@ -79,6 +79,15 @@ The solver attempts strategies in this order:
    only the tools relevant to the task. Turn and output budgets scale within
    configured bounds. Text-only replies are not candidates.
 
+| Strategy | Eligibility | Success evidence | Miss or failure behavior |
+|---|---|---|---|
+| Recipe replay | Exact versioned generator fingerprint and answer format; practice or an in-memory prior replay validation for scored phases | Python exits zero and the exact extraction repeats identically; answer and rerun evidence use separate artifacts | Discard the fingerprint recipe and continue |
+| Deterministic fast path | Enabled handler matches title, category, format, prompt markers, files, and handler-specific invariants | Answer artifact plus a separate handler-verification artifact | `not_applicable` or `inconclusive` falls through to Claude; it is terminal under `FAST_PATH_ONLY=1` |
+| Claude tool loop | Fast paths are disabled or did not solve, and `FAST_PATH_ONLY=0` | `record_answer` supplies evidence and either an artifact extraction or a direct model value | Retry, deferred recovery, or terminal failure according to the configured attempt budget |
+
+See [Deterministic solvers](deterministic-solvers.md) for the current handler
+inventory and recognition contract.
+
 The model tools are:
 
 | Tool | Purpose |
@@ -91,8 +100,29 @@ The model tools are:
 | `write_file` | Create a task-local helper or patch |
 | `extract_archive` | Extract supported archives with traversal and size checks |
 | `run_python` | Execute bounded Python and store full output as artifacts |
-| `http_request` | Make same-host requests with optional named cookie sessions |
+| `http_request` | Make requests whose initial URL is on the event host, with optional named cookie sessions |
 | `record_answer` | Resolve and record the only valid model-produced candidate |
+
+Tool exposure is narrowed before each model call:
+
+| Tool set | Categories |
+|---|---|
+| `list_files`, `inspect_file`, `read_file`, `search_files`, `search_artifact`, `run_python`, `record_answer` | All categories |
+| `http_request` | The Dark Web only |
+| `write_file` | Ship It and Heavy Compute |
+| `extract_archive` | Ship It, Cryptic, or any task whose original files have a supported archive suffix |
+
+Normal model-turn budgets are `min(MAX_TURNS, 8)` for 100–300-point tiles,
+`min(MAX_TURNS, 10)` for 400-point tiles, and `MAX_TURNS` for 500-point tiles.
+At most one additional finalization turn is available, and only after a failed
+`record_answer` attempt. The finalizer sees a bounded artifact snapshot and can
+call only `record_answer`.
+
+`record_answer` accepts either a direct model value or an artifact extraction,
+never both. Artifact extraction preserves the matched value without model
+retyping, then strips leading and trailing whitespace before storing the
+candidate. Only answers extracted from a `run_python` stdout artifact can carry
+a replay recipe.
 
 If a normal turn attempts but fails to record an answer, one restricted
 finalization turn may call `record_answer` using already-produced evidence.
@@ -105,9 +135,21 @@ finalization turn may call `record_answer` using already-produced evidence.
 - non-finite or below-threshold confidence;
 - missing evidence;
 - malformed numeric or literal formats;
-- invalid exact-match shapes; and
-- unreplayed scored 400/500-point answers without a separate verification
-  artifact.
+- unknown answer formats;
+- validator answers below `max(MIN_CONFIDENCE, 0.92)`;
+- directly model-retyped exact, case-insensitive exact, or validator answers
+  below `0.95`, and directly model-retyped numeric/literal answers below
+  `0.90`; and
+- every non-practice answer worth at least 400 points without a separate verification
+  artifact, including deterministic and replayed candidates.
+
+The verifier identifies practice candidates by the `PR-` task-ID prefix. It
+mechanically enforces a non-empty high-value verification source different from
+the answer source. Normal runtime paths supply artifacts, but
+`CandidateVerifier` itself does not validate artifact-ID shape or existence and
+cannot prove independent derivation. The solver prompt and deterministic
+handlers are responsible for making that separate source contain a genuinely
+independent check.
 
 Verification is structural. The hidden answer is known only to the event
 server, so this layer reduces predictable mistakes but cannot prove semantic
@@ -121,6 +163,20 @@ the family is trusted for the current phase. An incorrect canary increments
 the generation and invalidates queued siblings from the old generation.
 
 Recipe caches are in memory. They do not survive a process restart.
+
+Recipe replay and recipe gating serve different scopes:
+
+| Mechanism | Key | Purpose |
+|---|---|---|
+| Replay cache | Versioned structural generator fingerprint | Reuse one successful Python extraction only on structurally compatible sibling variants |
+| Recipe gate | `category:points` family plus generation | Hold scored sibling submissions behind a canary and invalidate a family generation after an incorrect result |
+
+A newly stored Python recipe is not immediately eligible in a scored phase. A
+practice replay of that exact generator fingerprint must first submit
+successfully during the same process lifetime. The gate considers a
+`category:points` family trusted after at least two correct submissions and no
+incorrect submissions. An untrusted family admits one canary in a scored phase;
+a correct canary opens that family for the rest of that phase.
 
 ### 7. Submission
 
