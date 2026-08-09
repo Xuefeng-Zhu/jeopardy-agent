@@ -36,7 +36,7 @@ and model tool calls. Treat all task material as untrusted.
 ### Network
 
 - Model HTTP tools accept only HTTP(S).
-- Requests are restricted to the configured event hostname.
+- The initial request URL must use the configured event hostname.
 - Named sessions preserve cookies only within one task runtime.
 - Response bodies are capped and stored as internal artifacts; model context
   receives compact JSON shape, form/link metadata, or text samples.
@@ -49,7 +49,9 @@ and model tool calls. Treat all task material as untrusted.
 - Safe-regex checks reject backreferences, lookarounds, nested quantifiers,
   quantified alternations, repeated unbounded wildcards, and oversized
   patterns.
-- High-value scored candidates require independent verification evidence.
+- High-value scored candidates require an answer source and a distinct
+  verification-artifact source. The runtime asks for an independently derived
+  check but cannot prove semantic independence from artifact IDs alone.
 - A failed recipe canary invalidates queued siblings from the same generation.
 
 ### Resource bounds
@@ -62,6 +64,36 @@ and model tool calls. Treat all task material as untrusted.
 - Archive file count and expansion are bounded.
 - Model turns and response tokens are bounded.
 - CPU-heavy handlers and the submission lane have explicit concurrency limits.
+
+Effective limits and model-tool schema constraints include:
+
+| Resource | Limit |
+|---|---:|
+| Serialized tool response | 8,000 characters before compaction |
+| Stored artifact text | 250,000 characters |
+| HTTP body read before decoding | 250,000 bytes |
+| Cumulative targeted reads per caller-supplied path string and task runtime | 12,000 bytes |
+| One `read_file` window | 4,000 bytes |
+| File considered by `search_files` | 8,000,000 bytes |
+| Archive members | 256 files |
+| Expanded archive data | 16,000,000 bytes |
+| `.json` file structurally parsed by `inspect_file` | 1,000,000 bytes |
+| Regex pattern | 300 characters |
+| One searched physical line | 4,096 characters |
+| Schema-declared `write_file` content | 200,000 characters |
+| Schema-declared `run_python` source | 100,000 characters |
+| `run_python` wall timeout | 60 seconds |
+| Python address space, file output, descriptors, processes | Best effort: 1.5 GiB, 32 MiB, 64, 64 |
+
+The HTTP tool schema accepts timeout values through 60 seconds, but the current
+implementation passes a five-second Requests connect/read timeout. This is an
+inactivity timeout, not a five-second total wall-clock deadline for a streamed
+response.
+The `write_file` and `run_python` source lengths rely on model-tool schema
+validation; their handlers do not repeat those length checks. Read accounting
+uses the path spelling supplied by the caller, so aliases such as `foo` and
+`./foo` receive separate 12,000-byte budgets even when they resolve to the same
+physical file.
 
 ## Known limitations
 
@@ -76,12 +108,17 @@ Run this agent in the supplied hosted container or another disposable,
 least-privilege environment. Do not run model-driven tasks on a workstation
 that contains sensitive files accessible to the Python process.
 
-### Same-host HTTP trusts the event host
+### Redirects are not a complete same-host boundary
 
-The hostname restriction prevents arbitrary external hosts, but every path on
-the configured event host remains reachable to the tool. Do not point
-`JEOPARDY_BASE_URL` at a host that also exposes sensitive administrative
-services to the same identity.
+The runtime validates the hostname of an initial model-tool request and the
+explicit links selected by deterministic handlers. HTTP redirects are followed
+by default, and the final redirect target is not revalidated. The same hostname
+is also accepted with alternate ports or HTTP.
+
+Treat the configured event service and its redirects as trusted network
+infrastructure. Run the agent in an isolated environment without access to
+sensitive internal services. A hard same-host boundary would require disabling
+automatic redirects and validating every `Location` hop before following it.
 
 ### Structural verification is not an oracle
 

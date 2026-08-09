@@ -25,6 +25,12 @@ Known phases and playable board keys:
 | `round1` | `qual` |
 | `game` | `main` |
 
+Only these three phases have an explicit client mapping. If the service reports
+another phase, `live_board()` falls back to the first available key in
+`main`, `qual`, `practice` order. Treat that as protocol drift rather than proof
+that submissions are valid: keep `DRY_RUN=1`, inspect the board payload, and
+confirm the event's current lifecycle rules.
+
 Cells contain `open_ids`, `remaining`, and `total`. Every ID in `open_ids` is
 an independent, currently claimable tile. `open_tiles()` expands those stacks
 and excludes locked or previously solved IDs.
@@ -68,6 +74,12 @@ Downloads one task file. The client requests identity encoding, checks the HTTP
 status, rejects empty bodies, validates content length when it represents the
 decoded bytes, and installs the completed file atomically.
 
+Download reuse is process-local. A file is skipped only after this process
+completed its download and its size and modification time remain unchanged. A
+pre-existing file not known to the current process is replaced through a new
+temporary download. If cancellation or transfer validation fails, the old
+destination remains in place and the temporary file is removed.
+
 ### `POST /api/submit`
 
 Request:
@@ -91,11 +103,34 @@ Known result values include:
 These are application outcomes returned in successful HTTP responses. A
 response without a `result` field is treated as a failed call.
 
+The controller handles outcomes as follows:
+
+| Result | Controller action |
+|---|---|
+| `correct` | Mark the tile solved, update recipe/replay trust, and discard task runtime state |
+| `dry_run` | Mark the tile solved locally without an API submission |
+| `already_claimed`, `voided`, `unknown_task` | Mark the tile claimed/terminal and discard task runtime state |
+| `rate_limited`, `locked_out`, `locked`, `wrong_phase` | Retain the verified candidate and delay it using `retry_in`, `retry_after`, or `cooldown`, defaulting to five seconds |
+| `incorrect` | Increment and block the recipe generation, discard the exact replay fingerprint, disable the implicated fast handler for the next generation, and retry/fail affected siblings |
+| `forbidden` | Mark the tile failed; the client interprets this as scored submissions requiring the hosted agent |
+| Missing `result` field | Raise a transport-style client error; retain and delay the same candidate for five seconds |
+| Present but empty or unrecognized `result` | Schedule a fresh solve attempt, subject to attempt limits |
+
+Transport exceptions retain and delay the candidate rather than converting the
+call into an incorrect answer. The single submission lane enforces at least
+3.05 seconds between calls because the client assumes a three-second service
+limit.
+
+The client comments describe incorrect scored answers as point-costing and
+cooldown-triggering. Treat those event rules as service-controlled and verify
+the current round policy before removing `DRY_RUN=1`.
+
 ### `GET /api/me`
 
 Returns team identity, model usage, rate-limit information, and hosted-agent
-status. Live acceptance uses its `agent.state`, `agent.healthy`, and revision
-fields.
+status. Live acceptance passes or fails on `agent.state` and `agent.healthy`.
+It includes `agent.revision` in diagnostic output for an operator to compare,
+but does not validate that revision against local archive bytes.
 
 ## Hosted-agent endpoints
 
@@ -109,6 +144,12 @@ fields.
 
 The uploaded archive must contain `main.py` at its root. The runner executes
 `python -u main.py`. Every imported local module must also be present.
+
+Upload, start, and stop are external state changes. A successful HTTP response
+does not by itself prove sustained health. After an upload, compare the reported
+revision with the response/dashboard record, confirm `/api/me` reports
+`state="running"` and `healthy=true`, inspect recent logs, and run the live
+acceptance checks described in [Operations](operations.md#post-deployment-verification).
 
 ## Task categories
 
